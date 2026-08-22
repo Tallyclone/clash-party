@@ -28,6 +28,11 @@ interface IpcApi {
   mihomoUpdateRuleProviders: (name: string) => Promise<void>
   mihomoChangeProxy: (group: string, proxy: string) => Promise<IMihomoProxy>
   mihomoUnfixedProxy: (group: string) => Promise<IMihomoProxy>
+  restartScriptApiServer: () => Promise<void>
+  stopScriptApiServer: () => Promise<void>
+  scriptApiPort: () => Promise<number | null>
+  scriptApiRunning: () => Promise<boolean>
+  createScriptApiToken: () => Promise<string>
   mihomoUpgradeGeo: () => Promise<void>
   mihomoUpgrade: () => Promise<void>
   mihomoUpgradeUI: () => Promise<void>
@@ -200,6 +205,11 @@ export const {
   mihomoUpdateRuleProviders,
   mihomoChangeProxy,
   mihomoUnfixedProxy,
+  restartScriptApiServer,
+  stopScriptApiServer,
+  scriptApiPort,
+  scriptApiRunning,
+  createScriptApiToken,
   mihomoUpgradeGeo,
   mihomoUpgrade,
   mihomoUpgradeUI,

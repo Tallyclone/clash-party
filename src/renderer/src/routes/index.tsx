@@ -19,6 +19,7 @@ const DNS = lazy(() => import('@renderer/pages/dns'))
 const Sniffer = lazy(() => import('@renderer/pages/sniffer'))
 const SubStore = lazy(() => import('@renderer/pages/substore'))
 const Traffic = lazy(() => import('@renderer/pages/traffic'))
+const Outlet = lazy(() => import('@renderer/pages/outlet'))
 
 const HomeRedirect: React.FC = () => {
   const { appConfig } = useAppConfig()
@@ -92,6 +93,10 @@ const routes = [
   {
     path: '/traffic',
     element: <Traffic />
+  },
+  {
+    path: '/outlet',
+    element: <Outlet />
   },
   {
     path: '/',

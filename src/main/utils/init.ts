@@ -11,6 +11,7 @@ import {
   subStorePort,
   subStoreFrontendPort
 } from '../resolve/server'
+import { startScriptApiServer } from '../resolve/scriptApiServer'
 import { triggerSysProxy } from '../sys/sysproxy'
 import {
   getAppConfig,
@@ -476,6 +477,17 @@ export async function init(): Promise<void> {
           await startPacServer()
         }
         await triggerSysProxy(sysProxy.enable)
+      } catch {
+        // ignore
+      }
+    })()
+  )
+
+  // 脚本控制 API 与内核解耦，启动失败不应阻塞主流程
+  initTasks.push(
+    (async (): Promise<void> => {
+      try {
+        await startScriptApiServer()
       } catch {
         // ignore
       }

@@ -28,6 +28,7 @@ import ConnCard from '@renderer/components/sider/conn-card'
 import LogCard from '@renderer/components/sider/log-card'
 import MihomoCoreCard from '@renderer/components/sider/mihomo-core-card'
 import ResourceCard from '@renderer/components/sider/resource-card'
+import OutletCard from '@renderer/components/sider/outlet-card'
 import UpdaterButton from '@renderer/components/updater/updater-button'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import { applyTheme, setNativeTheme, setTitleBarOverlay } from '@renderer/utils/ipc'
@@ -215,7 +216,8 @@ const App: React.FC = () => {
     override: OverrideCard,
     substore: SubStoreCard,
     network: NetworkCard,
-    usage: UsageCard
+    usage: UsageCard,
+    outlet: OutletCard
   }
 
   return (
@@ -271,7 +273,9 @@ const App: React.FC = () => {
         >
           <div className="app-drag sticky top-0 z-40 backdrop-blur bg-transparent h-12.25">
             <div
-              className={`flex justify-between p-2 ${!useWindowFrame && platform === 'darwin' ? 'ml-15' : ''}`}
+              className={`flex justify-between p-2 ${
+                !useWindowFrame && platform === 'darwin' ? 'ml-15' : ''
+              }`}
             >
               <div className="flex ml-1">
                 <MihomoIcon className="h-8 leading-8 text-lg mx-px" />

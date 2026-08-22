@@ -118,6 +118,12 @@ const validInvokeChannels = [
   'subStoreFrontendPort',
   'subStoreSubs',
   'subStoreCollections',
+  // Script API
+  'restartScriptApiServer',
+  'stopScriptApiServer',
+  'scriptApiPort',
+  'scriptApiRunning',
+  'createScriptApiToken',
   // Theme
   'resolveThemes',
   'fetchThemes',

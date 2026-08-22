@@ -25,7 +25,8 @@ export const DEFAULT_SIDER_ORDER: SiderCardKey[] = [
   'log',
   'substore',
   'network',
-  'usage'
+  'usage',
+  'outlet'
 ]
 
 export const DEFAULT_NETWORK_INFO_CARD_ORDER: NetworkInfoCardKey[] = ['ip', 'topology', 'latency']
@@ -39,6 +40,77 @@ export const DEFAULT_MIHOMO_PORTS = {
 } as const
 
 export const DEFAULT_MIHOMO_SKIP_AUTH_PREFIXES = ['127.0.0.1/32', '::1/128']
+
+/** 脚本专用出口相关常量 */
+export const SCRIPT_OUTLET_LISTENER_PREFIX = 'party-outlet-'
+
+export const SCRIPT_OUTLET_GROUP_PREFIX = 'PARTY-OUTLET-'
+
+/** 出口 listener 固定只监听回环，避免在局域网暴露无鉴权代理 */
+export const SCRIPT_OUTLET_LISTEN_ADDRESS = '127.0.0.1'
+
+export const DEFAULT_SCRIPT_OUTLET_TEST_URL = 'https://cp.cloudflare.com/generate_204'
+
+export const DEFAULT_SCRIPT_OUTLET_INTERVAL = 300
+export const DEFAULT_SCRIPT_OUTLETS: IScriptOutlet[] = []
+
+/** 脚本控制 API 相关常量 */
+export const SCRIPT_API_LISTEN_ADDRESS = '127.0.0.1'
+
+export const DEFAULT_SCRIPT_API_PORT = 17890
+
+export const DEFAULT_SCRIPT_API_CONFIG: IScriptApiConfig = {
+  enable: false,
+  port: DEFAULT_SCRIPT_API_PORT,
+  token: '',
+  autoCloseConnection: true
+}
+
+/** 「能用」判定阈值（毫秒）。代理页面隐藏慢节点与脚本控制 API 过滤名单共用同一个口径 */
+export const DEFAULT_AVAILABLE_DELAY_THRESHOLD = 1000
+
+/** 代理页面默认不隐藏慢节点，需要用户主动打开 */
+export const DEFAULT_HIDE_SLOW_PROXIES = false
+
+/**
+ * 「隐藏慢节点」只在这些分组内生效；留空数组则对所有分组生效。
+ *
+ * 默认只管覆写脚本生成的「[能用]」「[出口能用]」两组：日常分组不该因为一次抖动
+ * 就少掉半屏节点，而这两组的存在意义本来就是「现在挑得出来能用的」。
+ * 两组成员逐项一致，区别只在前者供手动切换、后者专供脚本出口。
+ */
+export const DEFAULT_HIDE_SLOW_PROXIES_GROUPS = ['[能用]', '[出口能用]']
+
+/** 全量基线探测间隔（分钟）。这是唯一躲不掉的固定开销：界面要有延迟数字才能筛 */
+export const DELAY_PROBE_FULL_INTERVAL_MINUTES = 30
+
+/** 数据超过这个年龄，脚本请求名单时才值得先做一次现测（毫秒） */
+export const DELAY_PROBE_FRESH_MS = 5 * 60 * 1000
+
+/**
+ * 现测超时（毫秒）。压到略高于判定阈值即可 —— 慢于阈值的节点反正要被筛掉，
+ * 没必要等它把话说完。这是把等待从 5 秒压到 1 秒级的关键。
+ */
+export const DELAY_PROBE_QUICK_TIMEOUT = 1200
+
+/** 全量基线探测超时（毫秒）。没人等它，可以给宽一点以便区分「慢」和「死」 */
+export const DELAY_PROBE_FULL_TIMEOUT = 3000
+
+/**
+ * 现测的候选范围：上次延迟在此值以内的节点才参与。
+ * 故意放宽于判定阈值，这样偶尔抖到阈值以上的节点下一次现测还能自己爬回来，
+ * 不用等 30 分钟那轮全量。
+ */
+export const DELAY_PROBE_CANDIDATE_MAX_DELAY = 2000
+
+/** 全量基线探测并发 */
+export const DELAY_PROBE_FULL_CONCURRENCY = 32
+
+/** 现测并发。调高是为了让候选池一批打完，把等待压在一个超时周期内 */
+export const DELAY_PROBE_QUICK_CONCURRENCY = 64
+
+/** 启动后延迟多久跑第一次基线（毫秒），避开内核刚起来的忙碌期 */
+export const DELAY_PROBE_STARTUP_DELAY_MS = 20 * 1000
 
 export const DEFAULT_MIHOMO_LAN_ALLOWED_IPS = ['0.0.0.0/0', '::/0']
 

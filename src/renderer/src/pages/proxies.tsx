@@ -11,7 +11,7 @@ import { CgDetailsLess, CgDetailsMore } from 'react-icons/cg'
 import { TbCircleLetterD } from 'react-icons/tb'
 import { FaLocationCrosshairs } from 'react-icons/fa6'
 import { RxLetterCaseCapitalize } from 'react-icons/rx'
-import { MdVisibilityOff, MdDoubleArrow, MdOutlineSpeed } from 'react-icons/md'
+import { MdVisibilityOff, MdDoubleArrow, MdOutlineSpeed, MdTimerOff } from 'react-icons/md'
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { GroupedVirtuoso, GroupedVirtuosoHandle } from 'react-virtuoso'
 import ProxyItem from '@renderer/components/proxies/proxy-item'
@@ -21,6 +21,10 @@ import CollapseInput from '@renderer/components/base/collapse-input'
 import { includesIgnoreCase } from '@renderer/utils/includes'
 import { useControledMihomoConfig } from '@renderer/hooks/use-controled-mihomo-config'
 import { useTranslation } from 'react-i18next'
+import {
+  DEFAULT_AVAILABLE_DELAY_THRESHOLD,
+  DEFAULT_HIDE_SLOW_PROXIES_GROUPS
+} from '../../../shared/appConfig'
 
 const GROUP_EXPAND_STATE_KEY = 'proxy_group_expand_state'
 const EMPTY_GROUPS: IMihomoMixedGroup[] = []
@@ -136,7 +140,8 @@ const Proxies: React.FC = () => {
     proxyDisplayOrder = 'default',
     autoCloseConnection = true,
     proxyCols = 'auto',
-    delayTestConcurrency = 50
+    delayTestConcurrency = 50,
+    availableDelayThreshold = DEFAULT_AVAILABLE_DELAY_THRESHOLD
   } = appConfig || {}
 
   const [cols, setCols] = useState(1)
@@ -179,27 +184,54 @@ const Proxies: React.FC = () => {
     return proxies
   }, [])
 
+  // 「隐藏慢节点」的作用范围。留空数组 = 对所有分组生效
+  const slowFilterGroups = useMemo(
+    () => appConfig?.hideSlowProxiesGroups ?? DEFAULT_HIDE_SLOW_PROXIES_GROUPS,
+    [appConfig?.hideSlowProxiesGroups]
+  )
+
+  // 按钮悬浮提示里要说清楚「只对哪些组生效」，否则点了没反应会以为是坏的
+  const slowFilterScopeText = useMemo(
+    () =>
+      slowFilterGroups.length > 0 ? slowFilterGroups.join('、') : t('proxies.hideSlow.allGroups'),
+    [slowFilterGroups, t]
+  )
+
   const { groupCounts, allProxies } = useMemo(() => {
     const groupCounts: number[] = []
     const allProxies: (IMihomoProxy | IMihomoGroup)[][] = []
 
     groups.forEach((group, index) => {
       if (isOpen[index]) {
+        // 慢节点过滤是否作用于本组：总开关打开，且组名在范围内（范围为空则不限组）
+        const filterSlow =
+          !!appConfig?.hideSlowProxies &&
+          (slowFilterGroups.length === 0 || slowFilterGroups.includes(group.name))
         const filtered = group.all.filter((proxy) => {
           if (!proxy) return false
           if (!includesIgnoreCase(proxy.name, searchValue[index])) {
             return false
           }
-          if (appConfig?.hideUnavailableProxies) {
+          if (appConfig?.hideUnavailableProxies || filterSlow) {
             const isGroup = 'all' in proxy
             if (isGroup) {
               return true
             }
             if (!proxy.history || proxy.history.length === 0) {
+              // 没测过的照常显示：刚开机第一轮探测还没跑完，
+              // 若把没数据的也藏掉，「[能用]」会空成一片，看着像坏了
               return true
             }
             const lastDelay = proxy.history[proxy.history.length - 1].delay
             if (lastDelay === 0) {
+              // 延迟 0 = 连不上，两个开关任一在本组生效时都该藏
+              return false
+            }
+            // 慢节点：阈值与脚本控制 API 的过滤口径共用同一个设置项
+            if (
+              filterSlow &&
+              lastDelay > (appConfig?.availableDelayThreshold || DEFAULT_AVAILABLE_DELAY_THRESHOLD)
+            ) {
               return false
             }
           }
@@ -222,7 +254,10 @@ const Proxies: React.FC = () => {
     cols,
     searchValue,
     sortProxies,
-    appConfig?.hideUnavailableProxies
+    appConfig?.hideUnavailableProxies,
+    appConfig?.hideSlowProxies,
+    appConfig?.availableDelayThreshold,
+    slowFilterGroups
   ])
 
   const onChangeProxy = useCallback(
@@ -432,7 +467,9 @@ const Proxies: React.FC = () => {
       }
       return groups[index] ? (
         <div
-          className={`w-full pt-2 ${index === groupCounts.length - 1 && !isOpen[index] ? 'pb-2' : ''} px-2`}
+          className={`w-full pt-2 ${
+            index === groupCounts.length - 1 && !isOpen[index] ? 'pb-2' : ''
+          } px-2`}
         >
           <Card
             as="div"
@@ -544,7 +581,9 @@ const Proxies: React.FC = () => {
                     </Button>
                   </div>
                   <IoIosArrowBack
-                    className={`transition duration-200 ml-2 h-8 text-lg text-foreground-500 ${isOpen[index] ? '-rotate-90' : ''}`}
+                    className={`transition duration-200 ml-2 h-8 text-lg text-foreground-500 ${
+                      isOpen[index] ? '-rotate-90' : ''
+                    }`}
                   />
                 </div>
               </div>
@@ -585,7 +624,15 @@ const Proxies: React.FC = () => {
               ? { gridTemplateColumns: `repeat(${proxyCols}, minmax(0, 1fr))` }
               : {}
           }
-          className={`grid ${proxyCols === 'auto' ? 'sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5' : ''} ${groupIndex === groupCounts.length - 1 && innerIndex === groupCounts[groupIndex] - 1 ? 'pb-2' : ''} gap-2 pt-2 mx-2`}
+          className={`grid ${
+            proxyCols === 'auto'
+              ? 'sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5'
+              : ''
+          } ${
+            groupIndex === groupCounts.length - 1 && innerIndex === groupCounts[groupIndex] - 1
+              ? 'pb-2'
+              : ''
+          } gap-2 pt-2 mx-2`}
         >
           {Array.from({ length: cols }).map((_, i) => {
             if (!allProxies[groupIndex][innerIndex * cols + i]) return null
@@ -644,11 +691,41 @@ const Proxies: React.FC = () => {
             }}
           >
             <MdVisibilityOff
-              className={`text-lg ${appConfig?.hideUnavailableProxies ? 'text-warning' : 'text-foreground-500'}`}
+              className={`text-lg ${
+                appConfig?.hideUnavailableProxies ? 'text-warning' : 'text-foreground-500'
+              }`}
               title={
                 appConfig?.hideUnavailableProxies
                   ? t('proxies.hideUnavailable.enabled')
                   : t('proxies.hideUnavailable.disabled')
+              }
+            />
+          </Button>
+          <Button
+            size="sm"
+            isIconOnly
+            variant="light"
+            className="app-nodrag"
+            onPress={() => {
+              patchAppConfig({
+                hideSlowProxies: !appConfig?.hideSlowProxies
+              })
+            }}
+          >
+            <MdTimerOff
+              className={`text-lg ${
+                appConfig?.hideSlowProxies ? 'text-warning' : 'text-foreground-500'
+              }`}
+              title={
+                appConfig?.hideSlowProxies
+                  ? t('proxies.hideSlow.enabled', {
+                      delay: availableDelayThreshold,
+                      scope: slowFilterScopeText
+                    })
+                  : t('proxies.hideSlow.disabled', {
+                      delay: availableDelayThreshold,
+                      scope: slowFilterScopeText
+                    })
               }
             />
           </Button>

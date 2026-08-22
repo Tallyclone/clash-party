@@ -18,6 +18,7 @@ type SiderCardKey =
   | 'substore'
   | 'network'
   | 'usage'
+  | 'outlet'
 type NetworkInfoCardKey = 'ip' | 'topology' | 'latency'
 type AppTheme = 'system' | 'light' | 'dark'
 type MihomoGroupType = 'Selector' | 'URLTest' | 'Fallback' | 'LoadBalance' | 'Relay'
@@ -264,6 +265,49 @@ interface ICustomTrayIcons {
   tun?: string
 }
 
+type ScriptOutletMode = 'direct' | 'fallback'
+
+type ScriptOutletListenerType = 'mixed' | 'socks5' | 'http'
+
+interface IScriptOutlet {
+  id: string
+  enable: boolean
+  /** 监听端口，脚本通过 --proxy-server=127.0.0.1:<port> 指向该出口 */
+  port: number
+  /** 入站类型，mixed 同时支持 HTTP 与 SOCKS5 */
+  type: ScriptOutletListenerType
+  /**
+   * direct: proxy 直接指向 target（节点名或已有策略组名），不生成额外策略组
+   * fallback: 用 targets 生成一个专用 fallback 组，listener 指向该组，具备容错能力
+   */
+  mode: ScriptOutletMode
+  /** mode=direct 时使用：节点名或策略组名 */
+  target?: string
+  /** mode=fallback 时使用：按顺序容错的节点名列表 */
+  targets?: string[]
+  /** mode=fallback 时的健康检查地址，为空则用默认值 */
+  testUrl?: string
+  /** mode=fallback 时的健康检查间隔（秒），为空则用默认值 */
+  interval?: number
+  /** 备注，仅 UI 展示，例如“USA-签到专用” */
+  remark?: string
+  udp?: boolean
+}
+
+/**
+ * 脚本控制 API：给外部脚本提供一个受限的 HTTP 接口，
+ * 让脚本能在运行时主动切换策略组节点，而无需开放 mihomo 的 external-controller。
+ */
+interface IScriptApiConfig {
+  enable?: boolean
+  /** HTTP 监听端口 */
+  port?: number
+  /** 访问令牌，请求需带 Authorization: Bearer <token> */
+  token?: string
+  /** 切换节点后是否自动断开旧连接，让新节点立即生效 */
+  autoCloseConnection?: boolean
+}
+
 interface IAppConfig {
   core: 'mihomo' | 'mihomo-alpha' | 'mihomo-smart' | 'mihomo-specific'
   specificVersion?: string
@@ -279,6 +323,12 @@ interface IAppConfig {
   envType?: ('bash' | 'cmd' | 'powershell' | 'fish' | 'nushell')[]
   proxyCols: 'auto' | '1' | '2' | '3' | '4'
   hideUnavailableProxies?: boolean
+  /** 代理页面隐藏延迟超过 availableDelayThreshold 的节点（未测过的节点照常显示） */
+  hideSlowProxies?: boolean
+  /** 「隐藏慢节点」只在这些分组内生效；留空则对所有分组生效 */
+  hideSlowProxiesGroups?: string[]
+  /** 「能用」判定阈值（毫秒）：代理页面隐藏慢节点、脚本控制 API 过滤名单都用它 */
+  availableDelayThreshold?: number
   connectionDirection: 'asc' | 'desc'
   connectionOrderBy: 'time' | 'upload' | 'download' | 'uploadSpeed' | 'downloadSpeed'
   connectionViewMode?: 'list' | 'table'
@@ -406,6 +456,11 @@ interface IAppConfig {
   testProfileOnStart?: boolean
   useHotReloadProfile?: boolean
   hotReloadProfileAutoCloseConnection?: boolean
+  /** 脚本专用出口：为每个出口生成独立 listener，供外部脚本用 --proxy-server 指定 */
+  scriptOutlets?: IScriptOutlet[]
+  /** 脚本控制 API：受限 HTTP 接口，供脚本运行时切换策略组节点 */
+  scriptApi?: IScriptApiConfig
+  outletCardStatus?: CardStatus
 }
 
 interface IMihomoTunConfig {
@@ -490,6 +545,16 @@ interface IMihomoProfileConfig {
   'store-fake-ip'?: boolean
 }
 
+/** mihomo listeners 入站监听器，用于给脚本提供独立出口端口 */
+interface IMihomoListener {
+  name: string
+  type: string
+  port: number
+  listen?: string
+  proxy?: string
+  udp?: boolean
+}
+
 interface IMihomoConfig {
   'external-controller-pipe': string
   'external-controller-unix': string
@@ -518,8 +583,9 @@ interface IMihomoConfig {
   'lan-disallowed-ips'?: string[]
   authentication: string[]
   port?: number
-  proxies?: []
-  'proxy-groups'?: []
+  proxies?: Record<string, unknown>[]
+  'proxy-groups'?: Record<string, unknown>[]
+  listeners?: IMihomoListener[]
   rules?: []
   hosts?: { [key: string]: string | string[] }
   'geodata-mode'?: boolean

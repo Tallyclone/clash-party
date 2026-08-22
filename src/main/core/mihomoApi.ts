@@ -300,7 +300,8 @@ export const mihomoGroups = async (): Promise<IMihomoMixedGroup[]> => {
   const [proxies, runtime] = await Promise.all([mihomoProxies(), getRuntimeConfig()])
   const rawGroups: { group: IMihomoGroup; providers: string[] }[] = []
 
-  runtime?.['proxy-groups']?.forEach((group: { name: string; url?: string; use?: string[] }) => {
+  runtime?.['proxy-groups']?.forEach((rawGroup) => {
+    const group = rawGroup as unknown as { name: string; url?: string; use?: string[] }
     const proxy = proxies.proxies[group.name]
     if (isMihomoGroup(proxy) && !proxy.hidden) {
       rawGroups.push({ group: { ...proxy, testUrl: group.url }, providers: group.use || [] })
@@ -389,7 +390,13 @@ export const mihomoUpgradeGeo = async (): Promise<void> => {
 export const mihomoProxyDelay = async (
   proxy: string,
   url?: string,
-  provider?: string
+  provider?: string,
+  /**
+   * 覆盖本次测速的超时（毫秒）。延迟探测模块用它把现测压到 1 秒级：
+   * 慢于判定阈值的节点反正要被筛掉，没必要等满全局的 5 秒。
+   * 不传则沿用设置页的「测速超时」，保持手动测速行为不变。
+   */
+  timeoutOverride?: number
 ): Promise<IMihomoDelay> => {
   const appConfig = await getAppConfig()
   const { delayTestUrl, delayTestTimeout } = appConfig
@@ -400,7 +407,7 @@ export const mihomoProxyDelay = async (
   return await instance.get(path, {
     params: {
       url: delayTestUrl || url || 'https://www.gstatic.com/generate_204',
-      timeout: delayTestTimeout || 5000
+      timeout: timeoutOverride || delayTestTimeout || 5000
     }
   })
 }

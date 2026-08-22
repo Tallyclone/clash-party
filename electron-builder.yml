@@ -4,11 +4,17 @@ directories:
   buildResources: build
 files:
   - '!**/.vscode/*'
+  - '!.snow/*'
   - '!src/*'
   - '!aur/*'
   - '!images/*'
   - '!scripts/*'
   - '!extra/*'
+  # electron-builder 只会自动排除当前 directories.output；用
+  # --config.directories.output=distN 换目录时，旧的 dist/dist2 会被打进 asar 导致体积雪崩
+  - '!dist*'
+  - '!docs/*'
+  - '!deploy/*'
   - '!tailwind.config.js'
   - '!postcss.config.js'
   - '!electron.vite.config.{js,ts,mjs,cjs}'

@@ -16,6 +16,10 @@ import { platform, version } from '@renderer/utils/init'
 import { useTranslation } from 'react-i18next'
 import SettingItem from '../base/base-setting-item'
 import SettingCard from '../base/base-setting-card'
+import {
+  DEFAULT_AVAILABLE_DELAY_THRESHOLD,
+  DEFAULT_HIDE_SLOW_PROXIES_GROUPS
+} from '../../../../shared/appConfig'
 
 const MihomoConfig: React.FC = () => {
   const { t } = useTranslation()
@@ -26,6 +30,8 @@ const MihomoConfig: React.FC = () => {
     hotReloadProfileAutoCloseConnection = false,
     delayTestConcurrency,
     delayTestTimeout,
+    availableDelayThreshold = DEFAULT_AVAILABLE_DELAY_THRESHOLD,
+    hideSlowProxiesGroups = DEFAULT_HIDE_SLOW_PROXIES_GROUPS,
     githubToken = '',
     gistAgeEncrypt = false,
     gistAgeRecipient = '',
@@ -43,6 +49,7 @@ const MihomoConfig: React.FC = () => {
   } = appConfig || {}
   const [url, setUrl] = useState(delayTestUrl)
   const [pauseSSIDInput, setPauseSSIDInput] = useState(pauseSSID)
+  const [hideSlowGroupsInput, setHideSlowGroupsInput] = useState(hideSlowProxiesGroups)
   const setUrlDebounce = debounce((v: string) => {
     patchAppConfig({ delayTestUrl: v })
   }, 500)
@@ -157,6 +164,98 @@ const MihomoConfig: React.FC = () => {
           }}
         />
       </SettingItem>
+      <SettingItem
+        title={t('mihomo.availableDelayThreshold.title')}
+        actions={
+          <Tooltip content={t('mihomo.availableDelayThreshold.tip')}>
+            <Button isIconOnly size="sm" variant="light">
+              <IoIosHelpCircle className="text-lg text-default-500" />
+            </Button>
+          </Tooltip>
+        }
+        divider
+      >
+        <div className="flex items-center gap-2">
+          <Input
+            type="number"
+            size="sm"
+            className="w-25"
+            value={availableDelayThreshold.toString()}
+            onValueChange={(v) => {
+              const num = parseInt(v)
+              if (Number.isNaN(num)) return
+              patchAppConfig({ availableDelayThreshold: num })
+            }}
+            onBlur={(e) => {
+              let num = parseInt(e.target.value)
+              if (Number.isNaN(num) || num <= 0) num = DEFAULT_AVAILABLE_DELAY_THRESHOLD
+              patchAppConfig({ availableDelayThreshold: num })
+            }}
+          />
+          <span className="text-default-500">{t('common.milliseconds')}</span>
+        </div>
+      </SettingItem>
+      <SettingItem
+        title={t('mihomo.hideSlowProxiesGroups.title')}
+        actions={
+          <Tooltip content={t('mihomo.hideSlowProxiesGroups.tip')}>
+            <Button isIconOnly size="sm" variant="light">
+              <IoIosHelpCircle className="text-lg text-default-500" />
+            </Button>
+          </Tooltip>
+        }
+      >
+        {hideSlowGroupsInput.join('\n') !== hideSlowProxiesGroups.join('\n') && (
+          <Button
+            size="sm"
+            color="primary"
+            onPress={() => {
+              // 空行是编辑过程中留下的，存之前清掉；全部清空即「对所有分组生效」
+              patchAppConfig({
+                hideSlowProxiesGroups: hideSlowGroupsInput
+                  .map((name) => name.trim())
+                  .filter((name) => name !== '')
+              })
+            }}
+          >
+            {t('common.confirm')}
+          </Button>
+        )}
+      </SettingItem>
+      <div className="flex flex-col items-stretch mt-2 mb-2">
+        {[...hideSlowGroupsInput, ''].map((groupName, index) => {
+          return (
+            <div key={index} className="flex mb-2">
+              <Input
+                size="sm"
+                fullWidth
+                placeholder={t('mihomo.hideSlowProxiesGroups.placeholder')}
+                value={groupName || ''}
+                onValueChange={(v) => {
+                  if (index === hideSlowGroupsInput.length) {
+                    setHideSlowGroupsInput([...hideSlowGroupsInput, v])
+                  } else {
+                    setHideSlowGroupsInput(hideSlowGroupsInput.map((a, i) => (i === index ? v : a)))
+                  }
+                }}
+              />
+              {index < hideSlowGroupsInput.length && (
+                <Button
+                  className="ml-2"
+                  size="sm"
+                  variant="flat"
+                  color="warning"
+                  onPress={() =>
+                    setHideSlowGroupsInput(hideSlowGroupsInput.filter((_, i) => i !== index))
+                  }
+                >
+                  <MdDeleteForever className="text-lg" />
+                </Button>
+              )}
+            </div>
+          )
+        })}
+      </div>
       <SettingItem
         title={t('mihomo.gist.title')}
         actions={

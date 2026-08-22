@@ -26,6 +26,7 @@ import { createLogger } from '../utils/logger'
 import { decryptAgeContent } from '../utils/age'
 import { DEFAULT_CONTROL_DNS, DEFAULT_CONTROL_SNIFF } from '../../shared/appConfig'
 import { atomicWriteFile } from '../utils/safeFile'
+import { injectScriptOutlets } from './scriptOutlet'
 
 const factoryLogger = createLogger('Factory')
 const SMART_OVERRIDE_ID = 'smart-core-override'
@@ -116,7 +117,8 @@ export async function generateProfile(
     diffWorkDir = false,
     controlDns = DEFAULT_CONTROL_DNS,
     controlSniff = DEFAULT_CONTROL_SNIFF,
-    useNameserverPolicy
+    useNameserverPolicy,
+    scriptOutlets
   } = await getAppConfig()
   const currentProfileItem = await getProfileItem(current)
   const ageSecretKey = currentProfileItem?.ageSecretKey || ''
@@ -178,6 +180,14 @@ export async function generateProfile(
   } else if (profile['external-ui'] === '') {
     delete partialProfile['external-ui']
     delete partialProfile['external-ui-url']
+  }
+  // 脚本专用出口：必须在 deepMerge 之后注入，否则会被受控配置覆盖；
+  // 放在 stringify 之前，保证订阅更新 / 切换配置后都会重新生成 listeners。
+  const outletResult = injectScriptOutlets(partialProfile, scriptOutlets)
+  if (outletResult.injected > 0 || outletResult.skipped.length > 0) {
+    factoryLogger.info(
+      `Script outlets injected: ${outletResult.injected}, skipped: ${outletResult.skipped.length}`
+    )
   }
   const nextRuntimeConfigStr = stringify(profile)
   const coreProfile = { ...profile }

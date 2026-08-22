@@ -1,7 +1,10 @@
 import {
+  DEFAULT_AVAILABLE_DELAY_THRESHOLD,
   DEFAULT_CONTROL_DNS,
   DEFAULT_CONTROL_SNIFF,
   DEFAULT_ENABLE_TRAFFIC_LOGGER,
+  DEFAULT_HIDE_SLOW_PROXIES,
+  DEFAULT_HIDE_SLOW_PROXIES_GROUPS,
   DEFAULT_MIHOMO_DNS_CONFIG,
   DEFAULT_MIHOMO_LAN_ALLOWED_IPS,
   DEFAULT_MIHOMO_PORTS,
@@ -10,6 +13,8 @@ import {
   DEFAULT_MIHOMO_TUN_CONFIG,
   DEFAULT_NAMESERVER_POLICY,
   DEFAULT_NETWORK_INFO_CARD_ORDER,
+  DEFAULT_SCRIPT_API_CONFIG,
+  DEFAULT_SCRIPT_OUTLETS,
   DEFAULT_SIDER_ORDER,
   DEFAULT_USE_SUB_STORE,
   getDefaultMihomoTunDevice,
@@ -79,7 +84,12 @@ export const defaultConfig: IAppConfig = {
   testProfileOnStart: true,
   coreStartupMode: 'log',
   useHotReloadProfile: false,
-  hotReloadProfileAutoCloseConnection: false
+  hotReloadProfileAutoCloseConnection: false,
+  scriptOutlets: DEFAULT_SCRIPT_OUTLETS,
+  scriptApi: DEFAULT_SCRIPT_API_CONFIG,
+  hideSlowProxies: DEFAULT_HIDE_SLOW_PROXIES,
+  hideSlowProxiesGroups: DEFAULT_HIDE_SLOW_PROXIES_GROUPS,
+  availableDelayThreshold: DEFAULT_AVAILABLE_DELAY_THRESHOLD
 }
 
 export const defaultControledMihomoConfig: Partial<IMihomoConfig> = {

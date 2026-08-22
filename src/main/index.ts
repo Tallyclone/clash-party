@@ -20,6 +20,7 @@ import {
 import { createTray } from './resolve/tray'
 import { init, initBasic, safeShowErrorBox, startSubStoreServices } from './utils/init'
 import { initShortcut } from './resolve/shortcut'
+import { initDelayProbe } from './core/delayProbe'
 import { initProfileUpdater } from './core/profileUpdater'
 import { startMonitor } from './resolve/trafficMonitor'
 import { showFloatingWindow } from './resolve/floatingWindow'
@@ -343,6 +344,7 @@ app
               initProfileUpdater().catch((e) =>
                 mainLogger.warn('Failed to init profile updater', e)
               ),
+              initDelayProbe().catch((e) => mainLogger.warn('Failed to init delay probe', e)),
               initWebdavBackupScheduler().catch((e) =>
                 mainLogger.warn('Failed to init webdav backup scheduler', e)
               ),

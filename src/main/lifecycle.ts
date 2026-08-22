@@ -6,6 +6,7 @@ import { app, powerMonitor } from 'electron'
 import { stopCoreForExit, cleanupCoreWatcher } from './core/manager'
 import { primeAdminPrivilegesCache } from './core/admin'
 import { triggerSysProxy, disableSysProxySync } from './sys/sysproxy'
+import { stopScriptApiServer } from './resolve/scriptApiServer'
 import { exePath } from './utils/dirs'
 import { saveMainWindowState } from './window'
 
@@ -109,7 +110,7 @@ export function setupAppLifecycle(): void {
         sysProxyDisabled = true
       }
 
-      const cleanupTasks: Promise<unknown>[] = [stopCoreForExit()]
+      const cleanupTasks: Promise<unknown>[] = [stopCoreForExit(), stopScriptApiServer()]
       if (process.platform === 'darwin') {
         cleanupTasks.push(
           triggerSysProxy(false, { helperTimeout: 750, force: true }).then(() => {

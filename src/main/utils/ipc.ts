@@ -65,6 +65,13 @@ import {
   subStorePort
 } from '../resolve/server'
 import {
+  createScriptApiToken,
+  getScriptApiPort,
+  isScriptApiRunning,
+  restartScriptApiServer,
+  stopScriptApiServer
+} from '../resolve/scriptApiServer'
+import {
   quitWithoutCore,
   restartCore,
   checkTunPermissions,
@@ -336,6 +343,9 @@ const asyncHandlers: Record<string, AsyncFn> = {
   downloadSubStore,
   subStoreSubs,
   subStoreCollections,
+  // Script API
+  restartScriptApiServer,
+  stopScriptApiServer,
   // Theme
   resolveThemes,
   fetchThemes,
@@ -384,6 +394,9 @@ const syncHandlers: Record<string, SyncFn> = {
   platform: () => process.platform,
   subStorePort: () => subStorePort,
   subStoreFrontendPort: () => subStoreFrontendPort,
+  scriptApiPort: () => getScriptApiPort(),
+  scriptApiRunning: () => isScriptApiRunning(),
+  createScriptApiToken: () => createScriptApiToken(),
   updateTrayIconImmediate,
   showMainWindow,
   closeMainWindow,

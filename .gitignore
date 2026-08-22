@@ -1,14 +1,61 @@
+# dependencies
 node_modules
+
+# build output / downloaded artifacts
 resources/files
 resources/sidecar
 extra
 dist
+dist[0-9]*
 out
-.DS_Store
+*.tsbuildinfo
+
+# logs
 *.log*
+logs
+
+# OS / editor
+.DS_Store
+Thumbs.db
 .idea
-*.ttf
+*.swp
+
+# AI assistant / local agent state
+.snow
+.claude
 party.md
 CLAUDE.md
 agent.md
-tsconfig.node.tsbuildinfo
+AGENTS.local.md
+
+# fonts (downloaded at build time)
+*.ttf
+
+# secrets & local env
+.env
+.env.*
+!.env.example
+*.local
+secrets.*
+*.secret
+
+# credentials / certificates / signing material
+*.pem
+*.key
+!**/public.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+id_rsa*
+id_ed25519*
+.npmrc.local
+
+# local databases (gateway runtime data)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3

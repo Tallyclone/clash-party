@@ -17,7 +17,8 @@ export const SIDER_CARD_ROUTES: Record<SiderCardKey, string> = {
   log: '/logs',
   substore: '/substore',
   network: '/network',
-  usage: '/traffic'
+  usage: '/traffic',
+  outlet: '/outlet'
 }
 
 export function mergeSiderOrder(saved: string[] = []): SiderCardKey[] {
