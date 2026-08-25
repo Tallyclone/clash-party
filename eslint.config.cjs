@@ -15,7 +15,11 @@ module.exports = [
       '**/resources/files/**',
       '**/resources/sidecar/**',
       '**/.snow/**',
-      '**/.claude/**'
+      '**/.claude/**',
+      // 本地重打包时手工备份的便携版 data：里面是用户覆写脚本和 sub-store 打包产物，
+      // 不忽略会报出上万条 error，直接卡死 pre-commit 钩子
+      '**/便携版data备份/**',
+      '**/.data-backup*/**'
     ]
   },
 

@@ -8,6 +8,9 @@ extra
 dist
 dist[0-9]*
 out
+# 本地重打包时手工备份的便携版 data（每份约 260MB），详见 electron-builder.yml 注释
+便携版data备份
+.data-backup*
 *.tsbuildinfo
 
 # logs

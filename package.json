@@ -31,6 +31,7 @@
     "postinstall": "electron-builder install-app-deps",
     "build:win": "electron-vite build && electron-builder --publish never --win",
     "build:win:dev": "pnpm run prepare:dev && electron-vite build && electron-builder --publish never --win",
+    "build:win:unpacked": "electron-vite build && electron-builder --win --dir --publish never && node scripts/post-build-portable.mjs",
     "build:mac": "electron-vite build && electron-builder --publish never --mac",
     "build:mac:dev": "pnpm run prepare:dev && electron-vite build && electron-builder --publish never --mac",
     "build:linux": "electron-vite build && electron-builder --publish never --linux",

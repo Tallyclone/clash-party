@@ -13,6 +13,11 @@ files:
   # electron-builder 只会自动排除当前 directories.output；用
   # --config.directories.output=distN 换目录时，旧的 dist/dist2 会被打进 asar 导致体积雪崩
   - '!dist*'
+  # 本地重打包时手工备份的便携版 data 目录（每份约 260MB）。放在项目根目录会被
+  # 默认收集进 app.asar，实测导致 asar 从 ~80MB 涨到 595MB。新增备份目录请沿用
+  # 这两种命名，或直接放到项目树之外。
+  - '!.data-backup*'
+  - '!*data备份*'
   - '!docs/*'
   - '!deploy/*'
   - '!tailwind.config.js'

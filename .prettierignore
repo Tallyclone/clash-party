@@ -1,5 +1,8 @@
 out
 dist
+# 本地重打包时手工备份的便携版 data，不参与格式化
+便携版data备份
+.data-backup*
 .claude
 pnpm-lock.yaml
 LICENSE.md
