@@ -5,6 +5,7 @@ import {
   SCRIPT_OUTLET_LISTEN_ADDRESS,
   SCRIPT_OUTLET_LISTENER_PREFIX
 } from '../../shared/appConfig'
+import { expandScriptOutlets, type IExpandedScriptOutlet } from '../../shared/scriptOutlet'
 import { createLogger } from '../utils/logger'
 
 const outletLogger = createLogger('script-outlet')
@@ -89,7 +90,9 @@ export function injectScriptOutlets(
   const result: IScriptOutletInjectResult = { injected: 0, skipped: [] }
   if (!outlets?.length) return result
 
-  const enabled = outlets.filter((outlet) => outlet.enable)
+  // 批量出口（count > 1）在这里展开成实际的单个出口，
+  // 之后的端口冲突 / 目标存在性校验全部以展开后的结果为准
+  const enabled = expandScriptOutlets(outlets.filter((outlet) => outlet.enable))
   if (!enabled.length) return result
 
   const reservedPorts = collectReservedPorts(profile)
@@ -121,7 +124,7 @@ export function injectScriptOutlets(
     ).length > 0
   )
 
-  const skip = (outlet: IScriptOutlet, reason: string): void => {
+  const skip = (outlet: IExpandedScriptOutlet, reason: string): void => {
     result.skipped.push({ id: outlet.id, reason })
     outletLogger.warn(`Skipped script outlet ${outlet.id}: ${reason}`)
   }

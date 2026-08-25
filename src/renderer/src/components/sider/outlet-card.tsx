@@ -6,6 +6,7 @@ import { useAppConfig } from '@renderer/hooks/use-app-config'
 import React from 'react'
 import { useTranslation } from 'react-i18next'
 import { TbPlugConnected } from 'react-icons/tb'
+import { normalizeOutletCount } from '../../../../shared/scriptOutlet'
 
 interface Props {
   iconOnly?: boolean
@@ -19,7 +20,10 @@ const OutletCard: React.FC<Props> = (props) => {
   const location = useLocation()
   const navigate = useNavigate()
   const match = location.pathname.includes('/outlet')
-  const enabledCount = (appConfig?.scriptOutlets || []).filter((outlet) => outlet.enable).length
+  // 统计实际生效的出口数量：批量条目要按展开后的 count 计，否则一张批量卡片只会算 1 个
+  const enabledCount = (appConfig?.scriptOutlets || [])
+    .filter((outlet) => outlet.enable)
+    .reduce((sum, outlet) => sum + normalizeOutletCount(outlet.count), 0)
   const {
     attributes,
     listeners,
@@ -63,7 +67,13 @@ const OutletCard: React.FC<Props> = (props) => {
         {...attributes}
         {...listeners}
         fullWidth
-        className={`${match ? 'bg-primary' : 'hover:bg-primary/30'} ${disableAnimations ? '' : `motion-reduce:transition-transform-background ${isDragging ? 'scale-[0.95] tap-highlight-transparent' : ''}`}`}
+        className={`${match ? 'bg-primary' : 'hover:bg-primary/30'} ${
+          disableAnimations
+            ? ''
+            : `motion-reduce:transition-transform-background ${
+                isDragging ? 'scale-[0.95] tap-highlight-transparent' : ''
+              }`
+        }`}
       >
         <CardBody className="pb-1 pt-0 px-0">
           <div className="flex justify-between items-start">
@@ -74,11 +84,15 @@ const OutletCard: React.FC<Props> = (props) => {
               color="default"
             >
               <TbPlugConnected
-                className={`${match ? 'text-primary-foreground' : 'text-foreground'} text-[24px] font-bold`}
+                className={`${
+                  match ? 'text-primary-foreground' : 'text-foreground'
+                } text-[24px] font-bold`}
               />
             </Button>
             <div
-              className={`pt-3 pr-3 text-sm ${match ? 'text-primary-foreground' : 'text-foreground-500'}`}
+              className={`pt-3 pr-3 text-sm ${
+                match ? 'text-primary-foreground' : 'text-foreground-500'
+              }`}
             >
               {enabledCount > 0 ? enabledCount : ''}
             </div>
@@ -86,7 +100,9 @@ const OutletCard: React.FC<Props> = (props) => {
         </CardBody>
         <CardFooter className="pt-1">
           <h3
-            className={`text-md font-bold text-ellipsis whitespace-nowrap overflow-hidden ${match ? 'text-primary-foreground' : 'text-foreground'}`}
+            className={`text-md font-bold text-ellipsis whitespace-nowrap overflow-hidden ${
+              match ? 'text-primary-foreground' : 'text-foreground'
+            }`}
           >
             {t('sider.cards.outlet')}
           </h3>

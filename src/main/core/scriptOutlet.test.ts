@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest'
-import { SCRIPT_OUTLET_LISTEN_ADDRESS } from '../../shared/appConfig'
+import {
+  SCRIPT_OUTLET_GROUP_PREFIX,
+  SCRIPT_OUTLET_LISTEN_ADDRESS,
+  SCRIPT_OUTLET_LISTENER_PREFIX
+} from '../../shared/appConfig'
 import { getOutletGroupName, getOutletListenerName, injectScriptOutlets } from './scriptOutlet'
 
 vi.mock('../utils/logger', () => ({
@@ -125,5 +129,84 @@ describe('injectScriptOutlets', () => {
     const result = injectScriptOutlets(profile, [outlet({ target: 'from-provider' })])
     expect(result.injected).toBe(1)
     expect(profile.listeners?.[0].proxy).toBe('from-provider')
+  })
+
+  it('expands a batch outlet into one listener per port', () => {
+    const profile = baseProfile()
+    const result = injectScriptOutlets(profile, [
+      outlet({
+        id: 'batch',
+        port: 7900,
+        count: 2,
+        remark: 'test',
+        batchTargets: ['US-01', 'TW-01']
+      })
+    ])
+
+    expect(result.injected).toBe(2)
+    expect(profile.listeners).toEqual([
+      {
+        name: `${SCRIPT_OUTLET_LISTENER_PREFIX}7900`,
+        type: 'mixed',
+        listen: SCRIPT_OUTLET_LISTEN_ADDRESS,
+        port: 7900,
+        proxy: 'US-01',
+        udp: true
+      },
+      {
+        name: `${SCRIPT_OUTLET_LISTENER_PREFIX}7901`,
+        type: 'mixed',
+        listen: SCRIPT_OUTLET_LISTEN_ADDRESS,
+        port: 7901,
+        proxy: 'TW-01',
+        udp: true
+      }
+    ])
+  })
+
+  it('skips only the batch member whose target is missing', () => {
+    const profile = baseProfile()
+    const result = injectScriptOutlets(profile, [
+      outlet({ id: 'batch', port: 7900, count: 3, batchTargets: ['US-01'] })
+    ])
+
+    // 第 1 个有目标可注入，后两个目标缺失被跳过
+    expect(result.injected).toBe(1)
+    expect(result.skipped.map((s) => s.id)).toEqual(['batch#02', 'batch#03'])
+    expect(profile.listeners?.map((l) => l.port)).toEqual([7900])
+  })
+
+  it('detects port conflicts between a batch range and a single outlet', () => {
+    const profile = baseProfile()
+    const result = injectScriptOutlets(profile, [
+      outlet({ id: 'batch', port: 7900, count: 3, batchTargets: ['US-01', 'US-01', 'US-01'] }),
+      outlet({ id: 'single', port: 7901 })
+    ])
+
+    // 批量占用 7900~7902，单出口的 7901 落在区间内被跳过
+    expect(result.injected).toBe(3)
+    expect(result.skipped.map((s) => s.id)).toEqual(['single'])
+  })
+
+  it('creates one fallback group per port sharing the same targets', () => {
+    const profile = baseProfile()
+    injectScriptOutlets(profile, [
+      outlet({
+        id: 'batch',
+        port: 7900,
+        count: 2,
+        mode: 'fallback',
+        target: undefined,
+        targets: ['US-01', 'TW-01']
+      })
+    ])
+
+    const groups = (profile['proxy-groups'] ?? []).filter((g) =>
+      String(g.name).startsWith(SCRIPT_OUTLET_GROUP_PREFIX)
+    )
+    expect(groups).toHaveLength(2)
+    expect(
+      groups.every((g) => JSON.stringify(g.proxies) === JSON.stringify(['US-01', 'TW-01']))
+    ).toBe(true)
   })
 })

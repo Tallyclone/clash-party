@@ -285,6 +285,17 @@ interface IScriptOutlet {
   target?: string
   /** mode=fallback 时使用：按顺序容错的节点名列表 */
   targets?: string[]
+  /**
+   * 批量出口个数：为空或 <=1 表示普通单个出口。
+   * >1 时该条目在 UI 上仍是一张卡片，注入内核时展开为 count 个 listener：
+   * 端口从 port 起递增，备注为 remark + 补零序号（test01、test02…）。
+   */
+  count?: number
+  /**
+   * 批量 + mode=direct 时使用：按选择顺序 1:1 对应各出口端口的目标列表，
+   * 第 i 个出口用 batchTargets[i]。mode=fallback 时忽略，所有出口共用 targets。
+   */
+  batchTargets?: string[]
   /** mode=fallback 时的健康检查地址，为空则用默认值 */
   testUrl?: string
   /** mode=fallback 时的健康检查间隔（秒），为空则用默认值 */

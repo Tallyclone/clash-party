@@ -52,6 +52,10 @@ export const SCRIPT_OUTLET_LISTEN_ADDRESS = '127.0.0.1'
 export const DEFAULT_SCRIPT_OUTLET_TEST_URL = 'https://cp.cloudflare.com/generate_204'
 
 export const DEFAULT_SCRIPT_OUTLET_INTERVAL = 300
+
+/** 单条批量出口最多展开多少个 listener，防止误填个数把内核端口打满 */
+export const SCRIPT_OUTLET_MAX_BATCH_COUNT = 200
+
 export const DEFAULT_SCRIPT_OUTLETS: IScriptOutlet[] = []
 
 /** 脚本控制 API 相关常量 */
