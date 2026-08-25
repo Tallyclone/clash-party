@@ -294,24 +294,51 @@ async function resolveProviderProxies(
   return providerProxies
 }
 
-export const mihomoGroups = async (): Promise<IMihomoMixedGroup[]> => {
+/**
+ * 获取策略组列表。
+ *
+ * @param includeHidden 是否连 `hidden: true` 的策略组一起返回。
+ *   默认 false —— 代理页面、托盘菜单、脚本 API 都不该看到隐藏组。
+ *   仅「脚本专用出口」配置页需要传 true：那些组正是被刻意隐藏、
+ *   专供脚本出口引用的，若过滤掉就没法在出口页面选中它们。
+ */
+export const mihomoGroups = async (includeHidden = false): Promise<IMihomoMixedGroup[]> => {
   const { mode = 'rule' } = await getControledMihomoConfig()
   if (mode === 'direct') return []
   const [proxies, runtime] = await Promise.all([mihomoProxies(), getRuntimeConfig()])
   const rawGroups: { group: IMihomoGroup; providers: string[] }[] = []
 
+  // `hidden` 只存在于配置文件（runtime YAML）里，mihomo 的 /proxies API **不会**把它透传回来。
+  // 所以这里必须以 runtime 里声明的值为准；若去读 API 返回对象上的 .hidden，永远是 undefined，
+  // 隐藏组会全部漏出到代理页面和托盘菜单。
+  const hiddenNames = new Set<string>()
+  runtime?.['proxy-groups']?.forEach((rawGroup) => {
+    const group = rawGroup as unknown as { name?: string; hidden?: boolean }
+    if (group?.hidden && typeof group.name === 'string') hiddenNames.add(group.name)
+  })
+
+  const isVisible = (group: IMihomoProxy | IMihomoGroup | undefined): boolean =>
+    isMihomoGroup(group) && (includeHidden || !hiddenNames.has(group.name))
+
   runtime?.['proxy-groups']?.forEach((rawGroup) => {
     const group = rawGroup as unknown as { name: string; url?: string; use?: string[] }
     const proxy = proxies.proxies[group.name]
-    if (isMihomoGroup(proxy) && !proxy.hidden) {
-      rawGroups.push({ group: { ...proxy, testUrl: group.url }, providers: group.use || [] })
+    if (isVisible(proxy)) {
+      rawGroups.push({
+        group: {
+          ...(proxy as IMihomoGroup),
+          hidden: hiddenNames.has(group.name),
+          testUrl: group.url
+        },
+        providers: group.use || []
+      })
     }
   })
 
   if (!rawGroups.find(({ group }) => group.name === 'GLOBAL')) {
     const global = proxies.proxies['GLOBAL']
-    if (isMihomoGroup(global) && !global.hidden) {
-      rawGroups.push({ group: global, providers: [] })
+    if (isVisible(global)) {
+      rawGroups.push({ group: global as IMihomoGroup, providers: [] })
     }
   }
 

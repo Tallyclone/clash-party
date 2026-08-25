@@ -6,6 +6,7 @@ import {
   DELAY_PROBE_FRESH_MS,
   SCRIPT_API_LISTEN_ADDRESS
 } from '../../shared/appConfig'
+import { expandScriptOutlets } from '../../shared/scriptOutlet'
 import { getAppConfig } from '../config'
 import {
   ensureFreshDelays,
@@ -347,12 +348,13 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
   })
 
   // 列出已配置的脚本出口，方便脚本自检端口与目标是否匹配
+  // 批量出口在这里展开成逐个端口，返回结果与内核里实际的 listener 一一对应
   app.get('/outlets', async (_req, res) => {
     try {
       const { scriptOutlets = [] } = await getAppConfig()
       res.json({
         ok: true,
-        outlets: scriptOutlets.map((outlet) => ({
+        outlets: expandScriptOutlets(scriptOutlets).map((outlet) => ({
           port: outlet.port,
           enable: outlet.enable,
           mode: outlet.mode,

@@ -21,7 +21,7 @@ interface IpcApi {
   mihomoRules: () => Promise<IMihomoRulesInfo>
   mihomoRulesDisable: (rules: Record<string, boolean>) => Promise<void>
   mihomoProxies: () => Promise<IMihomoProxies>
-  mihomoGroups: () => Promise<IMihomoMixedGroup[]>
+  mihomoGroups: (includeHidden?: boolean) => Promise<IMihomoMixedGroup[]>
   mihomoProxyProviders: () => Promise<IMihomoProxyProviders>
   mihomoUpdateProxyProviders: (name: string) => Promise<void>
   mihomoRuleProviders: () => Promise<IMihomoRuleProviders>
