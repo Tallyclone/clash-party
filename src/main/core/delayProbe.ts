@@ -8,7 +8,11 @@ import {
   DELAY_PROBE_FULL_TIMEOUT,
   DELAY_PROBE_QUICK_CONCURRENCY,
   DELAY_PROBE_QUICK_TIMEOUT,
-  DELAY_PROBE_STARTUP_DELAY_MS
+  DELAY_PROBE_STARTUP_DELAY_MS,
+  SCRIPT_API_NAMED_PROBE_CONCURRENCY,
+  SCRIPT_API_NAMED_PROBE_MAX_NAMES,
+  SCRIPT_API_NAMED_PROBE_MAX_TIMEOUT,
+  SCRIPT_API_NAMED_PROBE_MIN_TIMEOUT
 } from '../../shared/appConfig'
 import { createLogger } from '../utils/logger'
 import { mihomoProxies, mihomoProxyDelay } from './mihomoApi'
@@ -292,6 +296,188 @@ export async function ensureFreshDelays(maxAgeMs: number): Promise<boolean> {
   if (age !== null && age <= maxAgeMs) return false
   await runProbeExclusive('quick')
   return true
+}
+
+/** 名单探测的结果。计数字段的用途是让脚本知道自己传的名单被怎么处理了 */
+export interface INamedProbeResult {
+  /** 实际测过的节点，顺序与传入名单一致 */
+  results: { name: string; delay: number }[]
+  /** 内核里查不到的名字。订阅更新后失效的旧名字通常落在这里 */
+  unknown: string[]
+  /** 拒测的名字：策略组，或 DIRECT/REJECT 这类内置出口 */
+  rejected: string[]
+  /** 传进来多少个（含重复与非法项） */
+  received: number
+  /** 去重后剩多少个 */
+  deduped: number
+  /** 校验通过、真正参与测速的有多少个 */
+  accepted: number
+  /** 因为超过名单上限被截掉多少个 */
+  truncated: number
+  /** 测出可用（延迟大于 0）的数量 */
+  aliveCount: number
+  /** 本次实际生效的超时（毫秒），已按上下限收敛 */
+  timeout: number
+  elapsedMs: number
+}
+
+/**
+ * 名单探测的全局并发闸门。
+ *
+ * 为什么不复用 probeNames() 的滑动窗口：那个窗口是**每次调用**各自一个，
+ * 两个请求同时进来就是两倍并发。这里要的是跨请求共享的总量上限，只能用信号量。
+ *
+ * 交接名额而不是「先减计数再让下一个抢」：后者中间有个计数为空的窗口，
+ * 会被同一 tick 里的其他 acquire 插队，导致实际并发超过上限。
+ */
+let namedProbeInflight = 0
+const namedProbeWaiters: (() => void)[] = []
+
+async function acquireNamedProbeSlot(): Promise<void> {
+  if (namedProbeInflight < SCRIPT_API_NAMED_PROBE_CONCURRENCY) {
+    namedProbeInflight += 1
+    return
+  }
+  await new Promise<void>((resolve) => {
+    namedProbeWaiters.push(resolve)
+  })
+}
+
+function releaseNamedProbeSlot(): void {
+  const next = namedProbeWaiters.shift()
+  if (next) next()
+  else namedProbeInflight -= 1
+}
+
+/** 同名去重：同一个节点 + 同一个超时正在测时，后来者复用同一个 Promise */
+const namedProbeByKey = new Map<string, Promise<number>>()
+
+/**
+ * 测一个节点，返回延迟（失败一律 0，与内核记 history 的口径一致）。
+ *
+ * 超时进 key 是必须的：不同超时测出来的是不同的东西（1200ms 下的 0 可能只是慢），
+ * 让它们互相冒充会给出错误答案。
+ */
+function probeOneNamed(name: string, timeout: number): Promise<number> {
+  const key = `${name}\u0000${timeout}`
+  const existing = namedProbeByKey.get(key)
+  if (existing) return existing
+
+  const task = (async () => {
+    // 名额在这里排队而不是在调用方排队，这样后来的同名请求能直接复用，不额外占名额
+    await acquireNamedProbeSlot()
+    try {
+      const res = await mihomoProxyDelay(name, undefined, undefined, timeout)
+      return typeof res?.delay === 'number' && res.delay > 0 ? res.delay : 0
+    } catch {
+      // 节点连不上是常态，内核那边已经记成 0 了，这里不往上抛
+      return 0
+    } finally {
+      releaseNamedProbeSlot()
+    }
+  })()
+
+  const tracked = task.finally(() => {
+    namedProbeByKey.delete(key)
+  })
+  namedProbeByKey.set(key, tracked)
+  return tracked
+}
+
+/**
+ * 按脚本给定的名单现测，返回逐节点延迟。供脚本控制 API 的 `POST /probe` 使用。
+ *
+ * 与全量/现测的三条关键区别，改动时不要「顺手统一」：
+ *
+ * 1. **不走单飞锁**。走锁的话脚本指定测 A/B/C，却可能 join 上一轮正在跑的全量，
+ *    等二十几秒拿回来的数据跟它要的名单毫无关系。这里用独立的并发闸门代替。
+ * 2. **不更新 state 里的任何字段**。lastProbeAt 代表「全局数据新鲜度」，
+ *    被 applyFreshness() 用来决定要不要跑现测；局部测几个节点不能代表全局变新，
+ *    刷了它会让带 maxDelay 的请求跳过真正需要的现测、悄悄返回陈旧名单。
+ *    lastProbedCount / lastAliveCount 同理，它们描述的是最近一轮全量或现测的覆盖面，
+ *    脚本靠它区分「确实都不可用」和「还没测过」。
+ * 3. **结果照样写进内核 history**，所以候选池判定和「能用」判定都能吃到。
+ *    这是好事，但也意味着高频调用会把 history 的 10 条挤满 —— 与 maxAge 下限
+ *    撞的是同一个物理天花板。
+ */
+export async function probeNamedProxies(
+  names: unknown,
+  timeoutInput?: number
+): Promise<INamedProbeResult> {
+  const startedAt = Date.now()
+  const raw = Array.isArray(names) ? names : []
+
+  const timeout =
+    typeof timeoutInput === 'number' && Number.isFinite(timeoutInput)
+      ? Math.min(
+          SCRIPT_API_NAMED_PROBE_MAX_TIMEOUT,
+          Math.max(SCRIPT_API_NAMED_PROBE_MIN_TIMEOUT, Math.floor(timeoutInput))
+        )
+      : DELAY_PROBE_QUICK_TIMEOUT
+
+  // 去重保留首次出现顺序：重复名不该占掉名单额度
+  const seen = new Set<string>()
+  const deduped: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    deduped.push(name)
+  }
+
+  const proxies = await mihomoProxies()
+  const unknown: string[] = []
+  const rejected: string[] = []
+  const valid: string[] = []
+
+  for (const name of deduped) {
+    const proxy = proxies.proxies?.[name]
+    if (!proxy) {
+      unknown.push(name)
+      continue
+    }
+    // 与 collectProbeTargets() 同一口径：测组等于测它当前选中的节点，结果归属不清
+    if ('all' in proxy) {
+      rejected.push(name)
+      continue
+    }
+    if (
+      SKIP_PROXY_NAMES.has(name) ||
+      SKIP_PROXY_TYPES.has(String(proxy.type ?? '').toLowerCase())
+    ) {
+      rejected.push(name)
+      continue
+    }
+    valid.push(name)
+  }
+
+  // 截断放在去重与校验之后：重复名、不存在的名、策略组名都不该占额度
+  const targets = valid.slice(0, SCRIPT_API_NAMED_PROBE_MAX_NAMES)
+  const delays = await Promise.all(targets.map((name) => probeOneNamed(name, timeout)))
+
+  const results = targets.map((name, index) => ({ name, delay: delays[index] }))
+  const aliveCount = delays.filter((delay) => delay > 0).length
+  const elapsedMs = Date.now() - startedAt
+
+  probeLogger.info(
+    `named probe done: ${aliveCount}/${targets.length} alive in ${elapsedMs}ms ` +
+      `(received ${raw.length}, unknown ${unknown.length}, rejected ${rejected.length}, ` +
+      `truncated ${valid.length - targets.length}, timeout ${timeout}ms)`
+  )
+
+  return {
+    results,
+    unknown,
+    rejected,
+    received: raw.length,
+    deduped: deduped.length,
+    accepted: targets.length,
+    truncated: valid.length - targets.length,
+    aliveCount,
+    timeout,
+    elapsedMs
+  }
 }
 
 export async function initDelayProbe(): Promise<void> {

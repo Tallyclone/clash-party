@@ -5,7 +5,8 @@ import {
   DEFAULT_AVAILABLE_DELAY_THRESHOLD,
   DELAY_PROBE_FRESH_MS,
   SCRIPT_API_LISTEN_ADDRESS,
-  SCRIPT_API_MIN_MAX_AGE_MS
+  SCRIPT_API_MIN_MAX_AGE_MS,
+  SCRIPT_API_NAMED_PROBE_MAX_NAMES
 } from '../../shared/appConfig'
 import { expandScriptOutlets } from '../../shared/scriptOutlet'
 import { getAppConfig } from '../config'
@@ -14,7 +15,8 @@ import {
   getDelayDataAgeMs,
   getDelayProbeSnapshot,
   probeAllProxies,
-  probeCandidateProxies
+  probeCandidateProxies,
+  probeNamedProxies
 } from '../core/delayProbe'
 import {
   mihomoChangeProxy,
@@ -329,13 +331,47 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
   })
 
   /**
-   * 主动触发一轮延迟探测。
+   * 主动触发一轮延迟探测。三种范围，按参数分派：
    *
-   * 默认只测候选池（上次成绩还不算太差的那批），约 1 秒级返回；
-   * 带 ?full=1 测全部节点，慢得多，一般只在刚启动或长时间没测时用。
+   * - 不带参数：只测候选池（最近几次成绩里还有能看的那批），约 1 秒级返回。
+   * - `?full=1`：测全部节点，慢得多（几百个节点要二十几秒），一般只在刚启动或长时间没测时用。
+   * - body 里带 `proxies` 数组：只测这批指定节点，并**逐节点**返回延迟。
+   *
+   * 名单走 body 而不是 query 是必须的：节点名普遍含 emoji、方括号和空格，
+   * 塞进 query 要逐个 encodeURIComponent，而且 URL 长度撑不住几百个名字。
+   *
+   * 名单探测与前两种不共享闸门，也不刷新全局数据新鲜度（细节见 probeNamedProxies 的注释），
+   * 所以响应里额外回一个 dataAgeMs 让脚本自己知道全局数据有多旧。
    */
   app.post('/probe', async (req, res) => {
     try {
+      const body = (req.body ?? {}) as Record<string, unknown>
+      if (Array.isArray(body.proxies)) {
+        const timeout = typeof body.timeout === 'number' ? body.timeout : undefined
+        const probe = await probeNamedProxies(body.proxies, timeout)
+        res.json({
+          ok: true,
+          scope: 'named',
+          limits: {
+            received: probe.received,
+            deduped: probe.deduped,
+            accepted: probe.accepted,
+            truncated: probe.truncated,
+            limit: SCRIPT_API_NAMED_PROBE_MAX_NAMES
+          },
+          timeout: probe.timeout,
+          elapsedMs: probe.elapsedMs,
+          probedCount: probe.accepted,
+          aliveCount: probe.aliveCount,
+          results: probe.results,
+          unknown: probe.unknown,
+          rejected: probe.rejected,
+          // 名单探测刻意不刷新这个时钟，所以它反映的是最近一轮全量/现测的年龄
+          dataAgeMs: getDelayDataAgeMs()
+        })
+        return
+      }
+
       const full = parseBoolean((req.query as Record<string, unknown>).full, false)
       const snapshot = full ? await probeAllProxies() : await probeCandidateProxies()
       res.json({
