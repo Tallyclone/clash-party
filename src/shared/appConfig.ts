@@ -70,6 +70,16 @@ export const DEFAULT_SCRIPT_API_CONFIG: IScriptApiConfig = {
   autoCloseConnection: true
 }
 
+/**
+ * `maxAge` 查询参数的下限（毫秒）。
+ *
+ * 没有下限的话，脚本传 `maxAge=1` 就会让几乎每个请求都判定数据过期，
+ * 于是现测被背靠背连续触发（唯一的刹车只有探测模块的单飞锁），内核持续满负荷测速。
+ * 另一个原因是候选池判定要回看内核的 history，而 history 只保留 10 条：
+ * 轮询过密时这 10 条只跨十几秒，「容忍几次失败」的机制会被直接烧穿。
+ */
+export const SCRIPT_API_MIN_MAX_AGE_MS = 30 * 1000
+
 /** 「能用」判定阈值（毫秒）。代理页面隐藏慢节点与脚本控制 API 过滤名单共用同一个口径 */
 export const DEFAULT_AVAILABLE_DELAY_THRESHOLD = 1000
 
@@ -101,11 +111,43 @@ export const DELAY_PROBE_QUICK_TIMEOUT = 1200
 export const DELAY_PROBE_FULL_TIMEOUT = 3000
 
 /**
- * 现测的候选范围：上次延迟在此值以内的节点才参与。
- * 故意放宽于判定阈值，这样偶尔抖到阈值以上的节点下一次现测还能自己爬回来，
- * 不用等 30 分钟那轮全量。
+ * 现测的候选范围：history 里的延迟在此值以内才算「还值得测一次」。
+ *
+ * 故意放宽于「能用」判定阈值（1000）—— 上一轮全量测出 1000~2000ms 的节点，
+ * 下一轮现测仍值得碰一次运气。注意这个放宽**只对全量产出的记录有意义**：
+ * 现测超时压到了 1200ms，失败会被内核记成 delay 0，
+ * 所以现测本身永远产不出 (1200, 2000] 区间的值。
+ * 「抖动的节点能自己爬回来」靠的不是这个上限，而是下面的回看条数。
  */
 export const DELAY_PROBE_CANDIDATE_MAX_DELAY = 2000
+
+/**
+ * 候选池判定回看的 history 条数。
+ *
+ * 只看最后一条的话，一次失败就等于永久除名：现测超时 1200ms，一个真实延迟抖到
+ * 1300ms 的健康节点会被记成 delay 0，此后所有现测都不再碰它，只能等下一轮全量捞回来。
+ * 实测 426 个节点的订阅里有 94 个（22%）处于「最近 3 条既有失败又有达标」的抖动状态，
+ * 因此这个容忍不是可选优化。
+ *
+ * 取 3 的含义是「容忍 2 次连续失败」。上限是内核侧的 history 长度（实测 10 条）。
+ * **设成 1 即精确等价于改动前的行为**，可以当回滚开关用（有单测保证）。
+ */
+export const DELAY_PROBE_CANDIDATE_HISTORY_COUNT = 3
+
+/**
+ * 候选池判定的陈旧上限（毫秒）：再往前的达标记录不再采信。
+ *
+ * 必须 ≥ (回看条数 - 1) × 全量间隔，否则时间窗会先咬住条数、让回看机制失效 ——
+ * 实测只有全量在写记录的节点是 30 分钟一条（占 79%），W=30min 时窗口内只剩 1 条，
+ * 等于把整个机制关掉。取「回看条数 × 全量间隔」留一轮余量。
+ *
+ * 放得足够宽之后，生效的约束只剩条数，于是判定语义与写入速率无关，
+ * 恒定是「容忍 N-1 次连续失败」—— 这一点很重要，因为实测各节点的写入间隔
+ * 相差 30 倍（全量 30min/条 vs 内核对 lazy 组健康检查时的 60s/条）。
+ * 它剩下的职责是兜住休眠唤醒、订阅节点不再被测这类「历史整体变古老」的场景。
+ */
+export const DELAY_PROBE_CANDIDATE_MAX_AGE_MS =
+  DELAY_PROBE_CANDIDATE_HISTORY_COUNT * DELAY_PROBE_FULL_INTERVAL_MINUTES * 60 * 1000
 
 /** 全量基线探测并发 */
 export const DELAY_PROBE_FULL_CONCURRENCY = 32

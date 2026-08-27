@@ -4,7 +4,8 @@ import express from 'express'
 import {
   DEFAULT_AVAILABLE_DELAY_THRESHOLD,
   DELAY_PROBE_FRESH_MS,
-  SCRIPT_API_LISTEN_ADDRESS
+  SCRIPT_API_LISTEN_ADDRESS,
+  SCRIPT_API_MIN_MAX_AGE_MS
 } from '../../shared/appConfig'
 import { expandScriptOutlets } from '../../shared/scriptOutlet'
 import { getAppConfig } from '../config'
@@ -103,7 +104,12 @@ async function resolveDelayFilter(
   const maxAgeSec = parsePositiveInt(query.maxAge)
   return {
     maxDelay,
-    maxAgeMs: maxAgeSec === null ? DELAY_PROBE_FRESH_MS : maxAgeSec * 1000,
+    // 下限不能省：maxAge 极小时几乎每个请求都判定过期，现测会被背靠背连续触发，
+    // 而且候选池回看的内核 history 只有 10 条，轮询过密时容忍机制会被直接烧穿
+    maxAgeMs:
+      maxAgeSec === null
+        ? DELAY_PROBE_FRESH_MS
+        : Math.max(SCRIPT_API_MIN_MAX_AGE_MS, maxAgeSec * 1000),
     wait: parseBoolean(query.wait, true)
   }
 }
