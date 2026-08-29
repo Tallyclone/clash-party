@@ -26,7 +26,9 @@ import { createLogger } from '../utils/logger'
 import { decryptAgeContent } from '../utils/age'
 import { DEFAULT_CONTROL_DNS, DEFAULT_CONTROL_SNIFF } from '../../shared/appConfig'
 import { atomicWriteFile } from '../utils/safeFile'
-import { injectScriptOutlets } from './scriptOutlet'
+import { injectProbeStations, injectScriptOutlets } from './scriptOutlet'
+import { setProbeStationPorts } from './probeStationRegistry'
+import { normalizeScriptApiConfig } from './scriptApi'
 
 const factoryLogger = createLogger('Factory')
 const SMART_OVERRIDE_ID = 'smart-core-override'
@@ -118,7 +120,8 @@ export async function generateProfile(
     controlDns = DEFAULT_CONTROL_DNS,
     controlSniff = DEFAULT_CONTROL_SNIFF,
     useNameserverPolicy,
-    scriptOutlets
+    scriptOutlets,
+    scriptApi
   } = await getAppConfig()
   const currentProfileItem = await getProfileItem(current)
   const ageSecretKey = currentProfileItem?.ageSecretKey || ''
@@ -189,6 +192,30 @@ export async function generateProfile(
       `Script outlets injected: ${outletResult.injected}, skipped: ${outletResult.skipped.length}`
     )
   }
+  // 探测工位：只服务 `POST /probe mode=ip`，脚本 API 没开就没有任何调用方，
+  // 没必要为此往配置里塞 100 个 listener + 100 个组（会拖慢内核 reload）。
+  // 必须放在 injectScriptOutlets 之后：业务出口的 listener 端口要先落进 profile.listeners，
+  // 工位才能把它们算进已占用端口，否则两边可能抢同一个端口导致内核启动失败。
+  const scriptApiConfig = normalizeScriptApiConfig(scriptApi)
+  if (scriptApiConfig.enable) {
+    const stationResult = injectProbeStations(partialProfile, [scriptApiConfig.port])
+    // 端口以注入结果为唯一真相源交给拨测侧（probeStation.ts），它不再自行推算。
+    // 每次生成配置都要登记，包括注入 0 个的情况 —— 否则切换配置后会拿着上一份
+    // 配置的端口去拨测，表现为成片的 dial_failed。
+    setProbeStationPorts(stationResult.ports, stationResult.windowStart)
+    const portRange = stationResult.ports.length
+      ? ` [${stationResult.ports[0]}-${stationResult.ports[stationResult.ports.length - 1]}]`
+      : ''
+    factoryLogger.info(
+      `Probe stations injected: ${stationResult.injected}${portRange}` +
+        (stationResult.skippedReason ? `, skipped: ${stationResult.skippedReason}` : '')
+    )
+  } else {
+    // 脚本 API 关掉时配置里没有工位，登记空表让 mode=ip 明确报错，
+    // 而不是去连上一次残留的端口。
+    setProbeStationPorts([], null)
+  }
+
   const nextRuntimeConfigStr = stringify(profile)
   const coreProfile = { ...profile }
   // 日志解析启动检测需要基础日志；预览和 Gist 保留用户的实际配置。

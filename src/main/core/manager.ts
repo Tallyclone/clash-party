@@ -606,6 +606,15 @@ function setupCoreListeners(
       managerLogger.warn('Failed to sync runtime config to Gist', error)
     }
     await patchMihomoConfig({ 'log-level': logLevel })
+    // 内核刚加载完配置：探测工位的端口预检结果失效，probeStore 里的节点名也可能整批变了。
+    // 动态 import 是刻意的 —— probeStation → delayProbe → mihomoApi → manager 已经成环，
+    // 静态引入会把这个循环闭合。
+    try {
+      const { notifyProbeConfigReloaded } = await import('./probeStation')
+      notifyProbeConfigReloaded('core-ready')
+    } catch (error) {
+      managerLogger.warn('Failed to notify probe modules after core startup', error)
+    }
   }
 
   proc.on('close', async (code, signal) => {

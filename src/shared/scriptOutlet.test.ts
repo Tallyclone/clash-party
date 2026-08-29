@@ -3,13 +3,15 @@ import { SCRIPT_OUTLET_MAX_BATCH_COUNT } from './appConfig'
 import {
   expandScriptOutlet,
   expandScriptOutlets,
+  findProbeStationWindow,
   formatBatchOutletRemark,
   formatOutletSequence,
   getOutletPortRange,
   getOutletPorts,
   isBatchOutlet,
   normalizeOutletCount,
-  outletSequenceWidth
+  outletSequenceWidth,
+  probeStationPort
 } from './scriptOutlet'
 
 const outlet = (patch: Partial<IScriptOutlet> = {}): IScriptOutlet => ({
@@ -159,5 +161,42 @@ describe('expandScriptOutlets', () => {
       outlet({ id: 'batch', port: 7900, count: 3, batchTargets: ['a', 'b', 'c'] })
     ])
     expect(expanded.map((item) => item.port)).toEqual([7800, 7900, 7901, 7902])
+  })
+})
+
+describe('findProbeStationWindow', () => {
+  it('returns the search start when nothing is reserved', () => {
+    expect(findProbeStationWindow(new Set(), 3, 18100, 49152)).toBe(18100)
+  })
+
+  it('skips past a fully reserved block instead of stepping one port at a time', () => {
+    // 实机踩过的场景：用户在界面里配了 port: 17900 / count: 100 的业务出口，
+    // 旧实现按死基址 17900 + index 逐个尝试，100 个工位全部被跳过、mode=ip 直接不可用。
+    const reserved = new Set<number>()
+    for (let port = 17900; port < 18000; port += 1) reserved.add(port)
+
+    expect(findProbeStationWindow(reserved, 100, 17900, 49152)).toBe(18000)
+  })
+
+  it('jumps to conflictAt + 1 when the conflict sits at the tail of the window', () => {
+    // 从窗口尾部往前扫的意义：撞在末尾时一次跳到冲突之后，而不是白扫整段。
+    const reserved = new Set<number>([18102])
+
+    expect(findProbeStationWindow(reserved, 3, 18100, 49152)).toBe(18103)
+  })
+
+  it('returns null when no window fits below the search end', () => {
+    // 上限是 Windows 动态端口范围下界，不能无边界扫下去。
+    expect(findProbeStationWindow(new Set(), 100, 49100, 49152)).toBeNull()
+  })
+
+  it('returns null for a non-positive count', () => {
+    expect(findProbeStationWindow(new Set(), 0, 18100, 49152)).toBeNull()
+  })
+
+  it('probeStationPort derives ports from the window start, so a shifted window stays consistent', () => {
+    const start = findProbeStationWindow(new Set([18100]), 2, 18100, 49152)
+    expect(start).toBe(18101)
+    expect([0, 1].map((index) => probeStationPort(start as number, index))).toEqual([18101, 18102])
   })
 })

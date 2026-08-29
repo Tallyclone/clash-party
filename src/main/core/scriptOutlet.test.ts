@@ -1,10 +1,19 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
+  PROBE_STATION_COUNT,
+  PROBE_STATION_GROUP_PREFIX,
+  PROBE_STATION_LISTENER_PREFIX,
+  PROBE_STATION_PORT_BASE,
   SCRIPT_OUTLET_GROUP_PREFIX,
   SCRIPT_OUTLET_LISTEN_ADDRESS,
   SCRIPT_OUTLET_LISTENER_PREFIX
 } from '../../shared/appConfig'
-import { getOutletGroupName, getOutletListenerName, injectScriptOutlets } from './scriptOutlet'
+import {
+  getOutletGroupName,
+  getOutletListenerName,
+  injectProbeStations,
+  injectScriptOutlets
+} from './scriptOutlet'
 
 vi.mock('../utils/logger', () => ({
   createLogger: () => ({
@@ -208,5 +217,99 @@ describe('injectScriptOutlets', () => {
     expect(
       groups.every((g) => JSON.stringify(g.proxies) === JSON.stringify(['US-01', 'TW-01']))
     ).toBe(true)
+  })
+})
+
+describe('injectProbeStations', () => {
+  const stationPorts = (profile: Partial<IMihomoConfig>): number[] =>
+    (profile.listeners ?? [])
+      .filter((listener) => String(listener.name).startsWith(PROBE_STATION_LISTENER_PREFIX))
+      .map((listener) => listener.port)
+
+  it('uses the default window when nothing conflicts', () => {
+    const profile = baseProfile()
+
+    const result = injectProbeStations(profile)
+
+    expect(result.injected).toBe(PROBE_STATION_COUNT)
+    expect(result.windowStart).toBe(PROBE_STATION_PORT_BASE)
+    expect(result.ports[0]).toBe(PROBE_STATION_PORT_BASE)
+    expect(result.ports).toHaveLength(PROBE_STATION_COUNT)
+    // 注入结果就是端口的唯一真相源，必须与实际写进 profile 的 listener 端口逐项一致
+    expect(stationPorts(profile)).toEqual(result.ports)
+  })
+
+  it('shifts the whole window past the user business outlets instead of skipping stations', () => {
+    // 实机故障复现：用户在界面里配了 port: 17900 / count: 100 的业务出口，
+    // 旧实现按死基址算端口、逐个跳过冲突，结果 injected=0 且 mode=ip 静默不可用。
+    const profile = baseProfile()
+    profile.listeners = []
+    for (let index = 0; index < 100; index += 1) {
+      profile.listeners.push({
+        name: `party-outlet-${17900 + index}`,
+        type: 'http',
+        listen: '127.0.0.1',
+        port: 17900 + index,
+        proxy: 'US-01'
+      } as IMihomoListener)
+    }
+
+    const result = injectProbeStations(profile)
+
+    expect(result.injected).toBe(PROBE_STATION_COUNT)
+    expect(result.ports.some((port) => port >= 17900 && port <= 17999)).toBe(false)
+    expect(result.skippedReason).toBeUndefined()
+  })
+
+  it('jumps over a block sitting on the default window', () => {
+    const profile = baseProfile()
+    profile.listeners = []
+    for (let index = 0; index < PROBE_STATION_COUNT; index += 1) {
+      profile.listeners.push({
+        name: `party-outlet-${PROBE_STATION_PORT_BASE + index}`,
+        type: 'http',
+        listen: '127.0.0.1',
+        port: PROBE_STATION_PORT_BASE + index,
+        proxy: 'US-01'
+      } as IMihomoListener)
+    }
+
+    const result = injectProbeStations(profile)
+
+    expect(result.windowStart).toBe(PROBE_STATION_PORT_BASE + PROBE_STATION_COUNT)
+    expect(result.injected).toBe(PROBE_STATION_COUNT)
+  })
+
+  it('treats the extra reserved ports (script api) as occupied', () => {
+    const profile = baseProfile()
+
+    const result = injectProbeStations(profile, [PROBE_STATION_PORT_BASE + 5])
+
+    expect(result.ports).not.toContain(PROBE_STATION_PORT_BASE + 5)
+    expect(result.injected).toBe(PROBE_STATION_COUNT)
+  })
+
+  it('group names are derived from the port, so a shifted window keeps them aligned', () => {
+    const profile = baseProfile()
+
+    const result = injectProbeStations(profile, [PROBE_STATION_PORT_BASE])
+
+    const groups = (profile['proxy-groups'] ?? []).filter((g) =>
+      String(g.name).startsWith(PROBE_STATION_GROUP_PREFIX)
+    )
+    expect(groups.map((g) => String(g.name))).toEqual(
+      result.ports.map((port) => `${PROBE_STATION_GROUP_PREFIX}${port}`)
+    )
+  })
+
+  it('skips entirely when the profile has nothing to probe', () => {
+    const profile: Partial<IMihomoConfig> = { 'mixed-port': 7890 }
+
+    const result = injectProbeStations(profile)
+
+    expect(result.injected).toBe(0)
+    expect(result.ports).toEqual([])
+    expect(result.windowStart).toBeNull()
+    expect(result.skippedReason).toContain('no proxies or proxy-providers')
   })
 })

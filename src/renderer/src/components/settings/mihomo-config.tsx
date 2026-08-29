@@ -41,6 +41,7 @@ const MihomoConfig: React.FC = () => {
     pauseSSID = [],
     disableDnsOnPauseSSID = false,
     delayTestUrl,
+    probeTestUrl,
     userAgent,
     subscriptionTimeout = 30000,
     mihomoCpuPriority = 'PRIORITY_NORMAL',
@@ -48,10 +49,14 @@ const MihomoConfig: React.FC = () => {
     proxyCols = 'auto'
   } = appConfig || {}
   const [url, setUrl] = useState(delayTestUrl)
+  const [probeUrl, setProbeUrl] = useState(probeTestUrl)
   const [pauseSSIDInput, setPauseSSIDInput] = useState(pauseSSID)
   const [hideSlowGroupsInput, setHideSlowGroupsInput] = useState(hideSlowProxiesGroups)
   const setUrlDebounce = debounce((v: string) => {
     patchAppConfig({ delayTestUrl: v })
+  }, 500)
+  const setProbeUrlDebounce = debounce((v: string) => {
+    patchAppConfig({ probeTestUrl: v })
   }, 500)
   const [ua, setUa] = useState(userAgent)
   const setUaDebounce = debounce((v: string) => {
@@ -163,6 +168,28 @@ const MihomoConfig: React.FC = () => {
             patchAppConfig({ delayTestTimeout: parseInt(v) })
           }}
         />
+      </SettingItem>
+      <SettingItem
+        title={t('mihomo.probeTest.url')}
+        actions={
+          <Tooltip content={t('mihomo.probeTest.tip')}>
+            <Button isIconOnly size="sm" variant="light">
+              <IoIosHelpCircle className="text-lg text-default-500" />
+            </Button>
+          </Tooltip>
+        }
+        divider
+      >
+        <Input
+          size="sm"
+          className="w-[60%]"
+          value={probeUrl}
+          placeholder={t('mihomo.probeTest.urlPlaceholder')}
+          onValueChange={(v) => {
+            setProbeUrl(v)
+            setProbeUrlDebounce(v)
+          }}
+        ></Input>
       </SettingItem>
       <SettingItem
         title={t('mihomo.availableDelayThreshold.title')}

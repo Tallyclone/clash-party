@@ -1,4 +1,8 @@
-import { SCRIPT_OUTLET_MAX_BATCH_COUNT } from './appConfig'
+import {
+  PROBE_STATION_GROUP_PREFIX,
+  PROBE_STATION_LISTENER_PREFIX,
+  SCRIPT_OUTLET_MAX_BATCH_COUNT
+} from './appConfig'
 
 /**
  * 批量出口的展开规则（主进程注入内核与渲染层预览共用同一份实现）。
@@ -98,4 +102,70 @@ export function expandScriptOutlet(outlet: IScriptOutlet): IExpandedScriptOutlet
 export function expandScriptOutlets(outlets: IScriptOutlet[] | undefined): IExpandedScriptOutlet[] {
   if (!outlets?.length) return []
   return outlets.flatMap((outlet) => expandScriptOutlet(outlet))
+}
+
+/**
+ * 探测工位（`POST /probe mode=ip` 专用）的端口与命名规则。
+ *
+ * 放在 shared 里是因为有两个使用方：注入配置的一侧（main/core/scriptOutlet.ts）
+ * 和拨测的一侧（main/core/probeStation.ts）。这条对应关系**两边必须完全一致**，
+ * 各写一份是踩过的坑：实验脚本把 `port = base + index` 写成别的算法，
+ * 于是 PUT 了一个组、却从下一个组的端口出网，整轮实际只反复拨测了几个固定节点，
+ * 而**结果看起来完全正常**。所以它只能有一份实现。
+ *
+ * ## base 为什么是参数而不是直接读常量
+ *
+ * 工位端口不再是固定区间。旧实现把 `PROBE_STATION_PORT_BASE` 当死基址，
+ * 实机上撞到用户自己配的一批业务出口（`port: 17900, count: 100`），
+ * 100 个工位【全部被跳过】、mode=ip 直接不可用。现在注入侧会先找一段连续空闲窗口，
+ * 窗口起点由 findProbeStationWindow 返回，所以这里必须显式收 base ——
+ * 让"用哪个基址"成为调用方的显式选择，而不是藏在常量里。
+ *
+ * 组名/listener 名一律由**端口**派生（不是由 index 派生），所以窗口整段平移时
+ * 组名↔端口的对应关系天然保持一致，不会重演上面那个错位。
+ */
+export function probeStationPort(base: number, index: number): number {
+  return base + index
+}
+
+/**
+ * 从 searchStart 起找第一段连续 count 个都不在 reserved 里的端口，返回窗口起点。
+ * 找不到返回 null（调用方据此明确报错，不做无边界扫描）。
+ *
+ * 为什么要"整段连续"而不是挑散落的空闲端口：工位端口本身没有连续性要求，
+ * 但连续窗口让日志、netstat 排查和文档描述都能用一个区间表达
+ * （"工位在 18100~18199"），散落的端口列表在排障时几乎没法核对。
+ * 端口空间足够大，连续性的代价可以忽略。
+ */
+export function findProbeStationWindow(
+  reserved: ReadonlySet<number>,
+  count: number,
+  searchStart: number,
+  searchEnd: number
+): number | null {
+  if (count <= 0) return null
+
+  let candidate = Math.max(1, Math.floor(searchStart))
+  while (candidate + count - 1 < searchEnd) {
+    // 从窗口尾部往前扫：撞车时能直接跳到冲突端口之后，不必逐个 +1 重试。
+    // 用户的业务出口往往是成百个连续端口，逐个 +1 会白扫上百轮。
+    let conflictAt = -1
+    for (let offset = count - 1; offset >= 0; offset -= 1) {
+      if (reserved.has(candidate + offset)) {
+        conflictAt = candidate + offset
+        break
+      }
+    }
+    if (conflictAt < 0) return candidate
+    candidate = conflictAt + 1
+  }
+  return null
+}
+
+export function probeStationGroupName(port: number): string {
+  return `${PROBE_STATION_GROUP_PREFIX}${port}`
+}
+
+export function probeStationListenerName(port: number): string {
+  return `${PROBE_STATION_LISTENER_PREFIX}${port}`
 }
