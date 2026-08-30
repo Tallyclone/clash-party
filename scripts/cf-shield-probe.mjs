@@ -30,6 +30,8 @@
  *   （--apply 最后那次热重载仍会重建 adapter，进行中的连接会断一次，这是无法避免的。）
  * - 默认会按**出口 IP** 去重：机场常把一个 IP 拆成十几个「节点」卖，同 IP 只保留延迟
  *   最低的那个。想看全量就加 `--dedupe-ip false`，输出的 yaml 里也留了 [过盾-全部] 组。
+ * - 出口 IP 优先走主进程的 `POST /probe` `mode:"ip"`（它有专用探测工位、三目标并行、
+ *   一次 50 个），旧版应用不支持时自动回落到经出口端口请求 `--ip-url` 逐个查。
  * - 结果写到 .snow/cf/ 下（gitignored）。
  */
 import fs from 'node:fs'
@@ -180,9 +182,11 @@ const OPTIONS = {
   // 同一出口 IP 只保留延迟最低的那个节点。机场常把一个 IP 拆成十几个「节点」卖，
   // 全塞进「过盾」组只会让手选列表变长，容灾能力一点没涨（那台机器一挂全挂）。
   dedupeIp: pickBool('dedupe-ip', 'dedupeIp', true),
-  // 回显出口 IP 的地址。要求：轻量、不被 CF 拦、响应里能直接找到 IP 字面量。
-  // ipify 返回裸 IP，cloudflare 的 /cdn-cgi/trace 返回 `ip=1.2.3.4` 这类 kv 文本，
-  // 两种都能用 —— 解析时按正则抠 IP，不假设响应格式。
+  // ⚠ 仅 **fallback** 用：出口 IP 首选走主进程的 POST /probe mode:"ip"（见 resolveExitIps）。
+  // 只有连那个都不支持（旧版应用）时才退回这里，经出口端口自己请求一次回显地址。
+  // 要求：轻量、不被 CF 拦、响应里能直接找到 IP 字面量。ipify 返回裸 IP，
+  // cloudflare 的 /cdn-cgi/trace 返回 `ip=1.2.3.4` 这类 kv 文本，两种都能用 ——
+  // 解析时按正则抠 IP，不假设响应格式。
   ipUrl: pickString('ip-url', 'ipUrl', 'https://api.ipify.org/'),
   // 把通过名单写回覆写脚本的 CF-SHIELD-AUTO 区块，并热重载内核让「过盾」组真的换人
   apply: pickBool('apply', 'apply', false),
@@ -278,46 +282,51 @@ if (!scriptApi.token) {
 const API_BASE = `http://127.0.0.1:${scriptApi.port ?? 17890}`
 const API_HEADERS = { Authorization: `Bearer ${scriptApi.token}` }
 
+// ---------------------------------------------------------------- API 封装
+
+const api = axios.create({ baseURL: API_BASE, headers: API_HEADERS, timeout: 60000 })
+
+async function apiGet(url) {
+  const res = await api.get(url)
+  return res.data
+}
+
+// ---------------------------------------------------------------- 出口工位
+
 /**
- * 备注补零宽度。⚠ 必须与 src/shared/scriptOutlet.ts 的 outletSequenceWidth 保持一致：
- * 至少两位（出口01），个数超过 99 时自动加宽。那边改了这里也要跟着改，
- * 否则 --outlet-prefix 会静默匹配不到任何出口。
+ * 可用工位取自主进程的 `GET /outlets` —— 它返回的是**展开后的逐端口列表**，备注由
+ * 服务端用 src/shared/scriptOutlet.ts 那一份唯一实现算好（前缀 + 补零序号），
+ * 端口也是展开后的真实 listener 端口，这里直接用即可。
+ *
+ * ⚠ 别再自己按 count 复刻补零规则（曾经这么干过）：服务端改了宽度或拼接方式，
+ * 这边不会报错，只会静默匹配不到出口，--outlet-prefix 直接退出，极难查。
+ * 顺带也不用再复刻 SCRIPT_OUTLET_MAX_BATCH_COUNT 的 200 上限，服务端已经夹好。
+ *
+ * 仍然要自己过滤的两条：只收 enable 为真、且 mode === 'direct' 且 target 非空的出口。
+ * 服务端把禁用条目、以及「批量目标给得不够、target 留空」的条目也一并返回了，
+ * 这些出口没有绑定策略组，拿来当工位切不了节点。
  */
-function outletSequenceWidth(count) {
-  return Math.max(2, String(Math.max(1, Math.floor(count))).length)
-}
-
-/** 展开批量出口卡片 → [{ port, group, remark }]（与 src/shared/scriptOutlet.ts 的规则一致） */
-function expandOutlets(outlets) {
-  const list = []
-  for (const outlet of outlets ?? []) {
-    if (!outlet?.enable) continue
-    // 上限 200 与 SCRIPT_OUTLET_MAX_BATCH_COUNT 对齐
-    const count = Number.isFinite(outlet.count)
-      ? Math.min(200, Math.max(1, Math.floor(outlet.count)))
-      : 1
-    const prefix = String(outlet.remark ?? '').trim()
-    if (count <= 1) {
-      if (outlet.mode === 'direct' && outlet.target)
-        list.push({ port: outlet.port, group: outlet.target, remark: prefix })
-      continue
-    }
-    const targets = (outlet.batchTargets ?? []).map((item) => String(item).trim())
-    const width = outletSequenceWidth(count)
-    for (let i = 0; i < count; i++) {
-      if (outlet.mode !== 'direct' || !targets[i]) continue
-      const sequence = String(i + 1).padStart(width, '0')
-      list.push({
-        port: outlet.port + i,
-        group: targets[i],
-        remark: prefix ? `${prefix}${sequence}` : sequence
-      })
-    }
+async function fetchOutlets() {
+  let data
+  try {
+    data = await apiGet('/outlets')
+  } catch (e) {
+    console.error(
+      `取出口列表失败（${e.response?.status ?? e.code ?? e.message}）：${API_BASE}/outlets\n` +
+        '请确认 Clash Party 正在运行、「脚本专用出口」已启用、令牌与 config.yaml 一致'
+    )
+    process.exit(1)
   }
-  return list
+  return (data?.outlets ?? [])
+    .filter((item) => item?.enable && item.mode === 'direct' && item.target)
+    .map((item) => ({
+      port: item.port,
+      group: item.target,
+      remark: String(item.remark ?? '').trim()
+    }))
 }
 
-const ALL_OUTLETS = expandOutlets(appConfig.scriptOutlets)
+const ALL_OUTLETS = await fetchOutlets()
 if (ALL_OUTLETS.length === 0) {
   console.error('没有可用的 direct 模式出口（需要「出口目标」绑定到具体策略组）')
   process.exit(1)
@@ -334,15 +343,6 @@ if (OUTLETS.length === 0) {
       `当前可用出口备注：${ALL_OUTLETS.map((item) => item.remark || '(空)').join(' ')}`
   )
   process.exit(1)
-}
-
-// ---------------------------------------------------------------- API 封装
-
-const api = axios.create({ baseURL: API_BASE, headers: API_HEADERS, timeout: 60000 })
-
-async function apiGet(url) {
-  const res = await api.get(url)
-  return res.data
 }
 
 /**
@@ -440,6 +440,89 @@ async function probeTarget(port, url) {
 
 // ------------------------------------------------------------ 出口 IP 识别
 
+/**
+ * 出口 IP 有两条路，优先级固定：
+ *
+ * 1. **主进程的 `POST /probe` `mode:"ip"`**（首选）。它有一池专用探测工位
+ *    （PARTY-PROBE-*，与本脚本用的业务出口互不相干，不会互相抢），一次收 50 个名字，
+ *    内部三个回显目标并行、首成功即掐断其余两个。实测 50 个节点约 2.6 秒。
+ * 2. **经出口端口自己请求 `--ip-url`**（fallback）。只在应用是旧版、没有 `mode:"ip"`
+ *    时才走这条：逐个节点一次请求，百量级节点会对 ipify 打上百次，有被限流的风险。
+ *
+ * 两条路都可能拿不到某个节点的 IP，一律当「IP 未知」保留，绝不因此丢节点（见 dedupeByExitIp）。
+ */
+
+/** 一次 mode:"ip" 最多送多少个名字。服务端上限是 PROBE_IP_MAX_NAMES，超了会被截断 */
+const STATION_IP_BATCH = 50
+
+/** 检测结果：null = 还没测，false = 不支持（走 fallback），{ batchSize } = 可用 */
+let stationIpMode = null
+
+/**
+ * 探一次 `mode:"ip"` 是否可用。
+ *
+ * 判据是响应里的 `mode === 'ip'`：旧版应用**不认识** body 里的 `mode` 字段，会当成
+ * 默认的延迟探测照常返回 200（`scope:"named"` + `results[].delay`）—— 只看状态码
+ * 会把旧版误判成支持，然后每个节点的 ip 都是 undefined，去重静默失效。
+ *
+ * 故意用一个不存在的节点名：新版会把它放进 `unknown` 并立刻返回，不占工位、不发请求。
+ */
+async function detectStationIpMode() {
+  try {
+    const res = await api.post(
+      '/probe',
+      { proxies: ['__cf_shield_capability_probe__'], mode: 'ip' },
+      { timeout: 60000 }
+    )
+    if (res.data?.mode !== 'ip') return false
+    const limit = Number(res.data?.limits?.limit)
+    return {
+      batchSize:
+        Number.isFinite(limit) && limit > 0 ? Math.min(limit, STATION_IP_BATCH) : STATION_IP_BATCH
+    }
+  } catch (e) {
+    // 400 = 旧版校验不过；500 = 工位一个都没监听（配置里没注入 / 内核还没重载这份配置）。
+    // 两种都退回 fallback：拿不到 IP 就整个去重失效，比慢一点严重得多。
+    console.warn(
+      `   mode:"ip" 不可用（${e.response?.status ?? e.code ?? e.message}），改用 --ip-url 逐个查`
+    )
+    return false
+  }
+}
+
+/**
+ * 用探测工位批量查出口 IP，原地写回 records[i].ip。
+ *
+ * 失败的名字按 --retry 再补测（工位拨测的失败率实测 5~9%，多半是回显目标自己抖了一下），
+ * 补测完还没有的就留 null 当「IP 未知」。
+ */
+async function fillExitIpsByStations(records, batchSize) {
+  const pending = new Map(records.filter((item) => !item.ip).map((item) => [item.name, item]))
+  for (let attempt = 0; attempt <= OPTIONS.retry && pending.size > 0; attempt++) {
+    const names = [...pending.keys()]
+    for (let offset = 0; offset < names.length; offset += batchSize) {
+      const slice = names.slice(offset, offset + batchSize)
+      let data
+      try {
+        data = (await api.post('/probe', { proxies: slice, mode: 'ip' }, { timeout: 180000 })).data
+      } catch (e) {
+        console.warn(
+          `   查出口 IP 失败（${e.response?.status ?? e.code ?? e.message}），这批留待重试`
+        )
+        continue
+      }
+      for (const item of data?.results ?? []) {
+        if (!item?.ip) continue
+        const record = pending.get(item.name)
+        if (!record) continue
+        record.ip = item.ip
+        pending.delete(item.name)
+      }
+    }
+  }
+  return records.length - pending.size
+}
+
 // 从任意响应体里抠出第一个 IP 字面量。ipify 返回裸 IP，cloudflare 的
 // /cdn-cgi/trace 返回 `ip=1.2.3.4` 这类 kv 文本，ip-api 返回 JSON ——
 // 与其为每种端点写一套解析，不如统一按正则找，换 --ip-url 时不用改代码。
@@ -532,9 +615,10 @@ async function probeNode(port) {
         ? passed * 2 > OPTIONS.targets.length
         : passed === OPTIONS.targets.length
 
-  // 只给通过的节点查 IP：没过盾的节点后面根本不会进名单，多这一次请求纯浪费时间。
-  // 复用同一个出口端口，所以查到的就是这个节点真实的出口 IP。
-  const ip = ok && OPTIONS.dedupeIp ? await resolveExitIp(port) : null
+  // 只有走 fallback（--ip-url）时才在这里顺手查 IP：复用同一个出口端口，所以拿到的
+  // 就是这个节点真实的出口 IP，而且只给过盾的节点查（没过的后面不进名单，纯浪费时间）。
+  // 走 mode:"ip" 时统一在探测跑完后批量查（见 main()），这里留 null。
+  const ip = ok && OPTIONS.dedupeIp && stationIpMode === false ? await resolveExitIp(port) : null
   return { ok, passed, results, ip }
 }
 
@@ -586,6 +670,18 @@ async function main() {
   if (nodes.length === 0) {
     console.error('待测名单为空。可能是刚启动还没测过延迟，先 POST /probe 预热再重试。')
     process.exit(1)
+  }
+
+  // ⚠ 能力探测必须在探测循环**开始前**做完：两条 IP 路径的时序不兼容 ——
+  // station 路径按节点名批量查（跑完再查也行），fallback 路径依赖「节点此刻还绑在
+  // 某个出口端口上」，只能在 probeNode 里顺手查。等 passList 出来再决定就来不及了。
+  if (OPTIONS.dedupeIp) {
+    stationIpMode = await detectStationIpMode()
+    console.log(
+      stationIpMode
+        ? `出口 IP     走 POST /probe mode:"ip"（每批 ${stationIpMode.batchSize} 个）\n`
+        : `出口 IP     走 fallback：经出口端口请求 ${OPTIONS.ipUrl}\n`
+    )
   }
 
   // 记录各组原本选中的节点，结束后还原，避免探测把你的出口组留在随机节点上
@@ -663,6 +759,13 @@ async function main() {
 
   passList.sort((a, b) => (a.delay ?? 9999) - (b.delay ?? 9999))
 
+  // 走 station 路径时，IP 是在这里一次性批量查的（探测循环里没查）。
+  // 必须在 dedupeByExitIp 之前填好，否则所有节点都是「IP 未知」，去重等于没开。
+  if (OPTIONS.dedupeIp && stationIpMode && passList.length > 0) {
+    const resolved = await fillExitIpsByStations(passList, stationIpMode.batchSize)
+    console.log(`出口 IP：${resolved}/${passList.length} 个已取到（其余当「IP 未知」保留）\n`)
+  }
+
   // 按出口 IP 去重（必须在排序之后：靠「已按延迟升序」这个前提留下最快的那个）。
   // finalList 才是真正写进「过盾」组的名单，passList 保留全量用于诊断输出。
   const dedupe = OPTIONS.dedupeIp
@@ -702,6 +805,9 @@ async function main() {
         final: finalList.length,
         dedupe: {
           enabled: OPTIONS.dedupeIp,
+          // IP 实际是从哪来的：station = 主进程 POST /probe mode:"ip"（首选），
+          // ip-url = 经出口端口自己请求 --ip-url（旧版应用才会走）。
+          source: OPTIONS.dedupeIp ? (stationIpMode ? 'station' : 'ip-url') : null,
           ipUrl: OPTIONS.ipUrl,
           uniqueIps: dedupe.uniqueIps,
           unknownIp: unknownIpCount,
