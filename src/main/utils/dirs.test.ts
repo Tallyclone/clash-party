@@ -1,3 +1,4 @@
+import path from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 let packaged = false
@@ -23,11 +24,20 @@ vi.mock('electron', () => ({
   }
 }))
 
+// 被测代码全程用 path.join / path.dirname 拼路径，产出的分隔符跟当前平台一致。
+// 所以这里的 fixture 与断言也必须用 path.join 组装，写死 POSIX 正斜杠会让 mock 在
+// Windows 上永远不命中，portable 用例会静默退化成非 portable。
+const appDataDir = path.join('/tmp', 'app-data')
+const exeFile = path.join('/tmp', 'runtime', 'Electron.app', 'Contents', 'MacOS', 'Electron')
+const exeDirPath = path.dirname(exeFile)
+const portableMarker = path.join(exeDirPath, 'PORTABLE')
+const portableDataPath = path.join(exeDirPath, 'data')
+
 vi.mock('fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('fs')>()
   return {
     ...original,
-    existsSync: (value: string) => portable && value.endsWith('/PORTABLE')
+    existsSync: (value: string) => portable && value === portableMarker
   }
 })
 
@@ -38,10 +48,10 @@ beforeEach(() => {
   portable = false
   appName = 'mihomo-party'
   Object.assign(paths, {
-    appData: '/tmp/app-data',
-    userData: '/tmp/app-data/mihomo-party',
-    home: '/tmp/home',
-    exe: '/tmp/runtime/Electron.app/Contents/MacOS/Electron'
+    appData: appDataDir,
+    userData: path.join(appDataDir, 'mihomo-party'),
+    home: path.join('/tmp', 'home'),
+    exe: exeFile
   })
   setPath.mockClear()
   setName.mockClear()
@@ -56,7 +66,7 @@ describe('configureAppPaths', () => {
     configureAppPaths()
 
     expect(setName).toHaveBeenCalledWith('mihomo-party-dev')
-    expect(paths.userData).toBe('/tmp/app-data/mihomo-party-dev')
+    expect(paths.userData).toBe(path.join(appDataDir, 'mihomo-party-dev'))
   })
 
   it('leaves packaged stable and dev-release builds on production paths', async () => {
@@ -66,7 +76,7 @@ describe('configureAppPaths', () => {
 
     expect(setName).not.toHaveBeenCalled()
     expect(setPath).not.toHaveBeenCalled()
-    expect(paths.userData).toBe('/tmp/app-data/mihomo-party')
+    expect(paths.userData).toBe(path.join(appDataDir, 'mihomo-party'))
   })
 
   it('keeps portable userData precedence over local development isolation', async () => {
@@ -75,10 +85,7 @@ describe('configureAppPaths', () => {
     configureAppPaths()
 
     expect(setName).toHaveBeenCalledWith('mihomo-party-dev')
-    expect(paths.userData).toBe('/tmp/runtime/Electron.app/Contents/MacOS/data')
-    expect(setPath).toHaveBeenLastCalledWith(
-      'userData',
-      '/tmp/runtime/Electron.app/Contents/MacOS/data'
-    )
+    expect(paths.userData).toBe(portableDataPath)
+    expect(setPath).toHaveBeenLastCalledWith('userData', portableDataPath)
   })
 })

@@ -1,5 +1,6 @@
 import {
   DEFAULT_SCRIPT_API_PORT,
+  PROBE_STATION_GROUP_PREFIX,
   SCRIPT_API_LISTEN_ADDRESS,
   SCRIPT_OUTLET_GROUP_PREFIX
 } from '../../shared/appConfig'
@@ -82,9 +83,18 @@ export function generateScriptApiToken(randomBytes: (size: number) => Uint8Array
     .join('')
 }
 
-/** 判断组名是否为脚本出口自动生成的隐藏组，这类组不允许脚本切换 */
+/**
+ * 判断组名是否为项目自动生成的隐藏组，这类组不允许脚本切换。
+ *
+ * 两类都要拦：
+ * - SCRIPT_OUTLET_GROUP_PREFIX（PARTY-OUTLET-*）：业务出口的 fallback 组，
+ *   脚本手动切它会让该出口脱离自动选优。
+ * - PROBE_STATION_GROUP_PREFIX（PARTY-PROBE-*）：`POST /probe mode=ip` 的探测工位。
+ *   工位的选中项由工位池独占管理，外部插一脚会让正在进行的拨测从别的节点出网，
+ *   拿回一个张冠李戴的出口 IP —— 而且结果看起来完全正常，无法察觉。
+ */
 export function isGeneratedOutletGroup(name: string): boolean {
-  return name.startsWith(SCRIPT_OUTLET_GROUP_PREFIX)
+  return name.startsWith(SCRIPT_OUTLET_GROUP_PREFIX) || name.startsWith(PROBE_STATION_GROUP_PREFIX)
 }
 
 export function getScriptApiBaseUrl(port: number): string {

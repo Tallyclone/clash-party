@@ -1,11 +1,21 @@
 import {
   DEFAULT_SCRIPT_OUTLET_INTERVAL,
   DEFAULT_SCRIPT_OUTLET_TEST_URL,
+  PROBE_STATION_COUNT,
+  PROBE_STATION_PORT_BASE,
+  PROBE_STATION_PORT_SEARCH_END,
   SCRIPT_OUTLET_GROUP_PREFIX,
   SCRIPT_OUTLET_LISTEN_ADDRESS,
   SCRIPT_OUTLET_LISTENER_PREFIX
 } from '../../shared/appConfig'
-import { expandScriptOutlets, type IExpandedScriptOutlet } from '../../shared/scriptOutlet'
+import {
+  expandScriptOutlets,
+  findProbeStationWindow,
+  probeStationGroupName,
+  probeStationListenerName,
+  probeStationPort,
+  type IExpandedScriptOutlet
+} from '../../shared/scriptOutlet'
 import { createLogger } from '../utils/logger'
 
 const outletLogger = createLogger('script-outlet')
@@ -208,6 +218,177 @@ export function injectScriptOutlets(
     })
     usedPorts.add(outlet.port)
     result.injected += 1
+  }
+
+  if (listeners.length) {
+    profile.listeners = listeners
+  }
+  if (groups.length) {
+    profile['proxy-groups'] = groups
+  }
+
+  return result
+}
+
+export interface IProbeStationInjectResult {
+  /** 实际注入的工位数量 */
+  injected: number
+  /** 实际注入的端口（升序）。这是端口的**唯一真相源**，拨测侧不要自行推算 */
+  ports: number[]
+  /** 实际使用的窗口起点；未能注入时为 null */
+  windowStart: number | null
+  /** 整体被跳过的原因（没有可探测节点 / 找不到连续空闲窗口） */
+  skippedReason?: string
+}
+
+/**
+ * 注入「探测工位」：PROBE_STATION_COUNT 个本地 http listener + 同样多的隐藏 select 组。
+ *
+ * ## 它解决什么
+ *
+ * `POST /probe mode=ip` 要拿到某个节点的**真实出口 IP**，内核没有这种接口 ——
+ * 唯一办法是把某个本地入站的出口固定到该节点，然后自己经这个入站去拨一个回显 IP 的网站。
+ * 而「把入站的出口固定到某节点」是**改选中项**，是一个全局可见的副作用：
+ * 两个脚本共用同一个组就会互相踩（A 切到 X，B 立刻切到 Y，A 的拨测从 Y 出网，
+ * 结果串味且无法察觉）。所以每个并发单位必须有自己独占的一对 listener + 组，
+ * 这一对就是一个「工位」。
+ *
+ * 同理，工位**不能借用用户配置的业务出口**：那些组正被第三方脚本读写，
+ * 拨测去切它们会让用户的业务流量静默走错节点，反向也会让拨测结果串味。
+ *
+ * 工位组以 PROBE_STATION_GROUP_PREFIX 开头，scriptApi.isGeneratedOutletGroup() 会拦住
+ * 脚本对它的 `PUT /groups/:group`，避免业务脚本把探测工位切走。
+ *
+ * ## 为什么用 http 而不是 mixed
+ *
+ * probeStation.ts 是手写 `CONNECT host:port HTTP/1.1` 上去的（要分段计时，
+ * 高层库把建连和请求揉在一起拆不出来），只需要 HTTP 代理语义，不需要 SOCKS5，
+ * 也不需要 UDP。给最小的能力面。
+ *
+ * ## 端口：整段让位，而不是逐个跳过
+ *
+ * 旧实现把端口写成常量 `BASE + index`，撞车的工位逐个跳过。实机上用户在界面里配了
+ * `port: 17900, count: 100` 的业务出口，与旧基址 100 个端口全撞，于是
+ * **一个工位都没注入**、mode=ip 完全不可用，而 app 照常启动、只在日志里留一行 ERROR。
+ *
+ * 现在改为：先从 PROBE_STATION_PORT_BASE 起找第一段**连续空闲**的 COUNT 个端口，
+ * 整段平移过去。这样用户在任何区间加出口，工位都会自动让位。
+ *
+ * 关键前提是**组名与 listener 名都由端口派生、不由 index 派生**，所以整段平移不会
+ * 造成组名↔端口错位 —— 那个错位踩过一次，表现是"结果看起来完全正常"，
+ * 实际上 PUT 了一个组却从下一个组的端口出网，整轮结论作废。
+ *
+ * 端口的唯一真相源是本函数返回的 `ports`，拨测侧从内核实际加载的配置里读，
+ * 不再按常量重算 —— 两边各算一份就是上面那个错位的土壤。
+ */
+export function injectProbeStations(
+  profile: Partial<IMihomoConfig>,
+  extraReservedPorts?: Iterable<number>
+): IProbeStationInjectResult {
+  const result: IProbeStationInjectResult = { injected: 0, ports: [], windowStart: null }
+
+  // 工位组要能选中「所有节点」：内联节点靠 proxies 逐个列出，provider 节点靠 use 引用。
+  // 不用 include-all —— 那个字段本机无法验证，一旦内核不认就是整份配置加载失败。
+  const inlineNames: string[] = []
+  if (Array.isArray(profile.proxies)) {
+    for (const proxy of profile.proxies) {
+      if (typeof proxy?.name === 'string' && proxy.name) inlineNames.push(proxy.name)
+    }
+  }
+  const providers = (profile as { 'proxy-providers'?: Record<string, unknown> })['proxy-providers']
+  const providerNames = providers ? Object.keys(providers) : []
+
+  if (!inlineNames.length && !providerNames.length) {
+    result.skippedReason = 'current profile has no proxies or proxy-providers to probe'
+    return result
+  }
+
+  const listeners: IMihomoListener[] = Array.isArray(profile.listeners)
+    ? [...profile.listeners]
+    : []
+  const groups: Record<string, unknown>[] = Array.isArray(profile['proxy-groups'])
+    ? [...profile['proxy-groups']]
+    : []
+
+  // 已占用端口：内核主入站 + external-controller + 已注入的业务出口 listener + 调用方额外传入的
+  const reservedPorts = collectReservedPorts(profile)
+  for (const listener of listeners) {
+    if (isValidPort(listener.port)) reservedPorts.add(listener.port)
+  }
+  if (extraReservedPorts) {
+    for (const port of extraReservedPorts) {
+      if (isValidPort(port)) reservedPorts.add(port)
+    }
+  }
+
+  const windowStart = findProbeStationWindow(
+    reservedPorts,
+    PROBE_STATION_COUNT,
+    PROBE_STATION_PORT_BASE,
+    PROBE_STATION_PORT_SEARCH_END
+  )
+  if (windowStart === null) {
+    // 整段找不到才算失败，而且必须让它显眼：这条路径下 mode=ip 完全不可用。
+    result.skippedReason =
+      `no free window of ${PROBE_STATION_COUNT} consecutive ports in ` +
+      `[${PROBE_STATION_PORT_BASE}, ${PROBE_STATION_PORT_SEARCH_END})`
+    outletLogger.error(`Probe stations skipped: ${result.skippedReason}`)
+    return result
+  }
+
+  const listenerNames = new Set(listeners.map((listener) => listener.name))
+  const groupNames = new Set(
+    groups.map((group) => (typeof group?.name === 'string' ? group.name : ''))
+  )
+
+  for (let index = 0; index < PROBE_STATION_COUNT; index += 1) {
+    const port = probeStationPort(windowStart, index)
+    const listenerName = probeStationListenerName(port)
+    const groupName = probeStationGroupName(port)
+
+    // 端口已由窗口查找保证空闲，这里只剩「同名 listener / 同名组已存在」这一类
+    // 与端口无关的碰撞（例如用户手写配置里恰好有 party-probe-* 命名）。
+    // 名字冲突时跳过单个工位是安全的：池子小一点、并行度低一点，不会错位。
+    if (!isValidPort(port)) continue
+    if (listenerNames.has(listenerName)) {
+      outletLogger.warn(`Probe station skipped: listener name ${listenerName} already exists`)
+      continue
+    }
+    if (groupNames.has(groupName)) {
+      outletLogger.warn(`Probe station skipped: group name ${groupName} already exists`)
+      continue
+    }
+
+    const group: Record<string, unknown> = {
+      name: groupName,
+      type: 'select',
+      // 该组仅供出口 IP 拨测使用，隐藏以免污染代理页面与托盘菜单
+      hidden: true
+    }
+    if (inlineNames.length) group.proxies = [...inlineNames]
+    if (providerNames.length) group.use = [...providerNames]
+    groups.push(group)
+    groupNames.add(groupName)
+
+    listeners.push({
+      name: listenerName,
+      // 只需要 HTTP CONNECT 语义（见函数注释），不给 socks、不给 udp
+      type: 'http',
+      listen: SCRIPT_OUTLET_LISTEN_ADDRESS,
+      port,
+      proxy: groupName,
+      udp: false
+    })
+    listenerNames.add(listenerName)
+    reservedPorts.add(port)
+    result.ports.push(port)
+    result.injected += 1
+  }
+
+  result.windowStart = result.injected > 0 ? windowStart : null
+  if (result.injected === 0) {
+    result.skippedReason = `all ${PROBE_STATION_COUNT} station names already exist in this profile`
+    outletLogger.error(`Probe stations skipped: ${result.skippedReason}`)
   }
 
   if (listeners.length) {

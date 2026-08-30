@@ -419,6 +419,17 @@ interface IAppConfig {
   delayTestConcurrency?: number
   delayTestUrl?: string
   delayTestTimeout?: number
+  /**
+   * 脚本专用出口的延迟探测地址（`POST /probe mode=delay` 与基线全量共用）。
+   *
+   * 与 delayTestUrl 分开是因为两者服务对象不同：delayTestUrl 是界面上「点一下测延迟」
+   * 给人看的，改它会立刻影响 UI 显示；而探测判据一旦换地址，probeStore 里所有旧记录
+   * 就不是同一口径的数据了（记录里带 url 字段正是为此）。让脚本侧有一个独立开关，
+   * 用户调 UI 测速地址时不会顺手打乱脚本的判据。
+   *
+   * 留空时回退到 delayTestUrl，再回退到内核默认的 https://www.gstatic.com/generate_204。
+   */
+  probeTestUrl?: string
   networkLatencyTargets?: INetworkLatencyTarget[]
   networkIPProvider?: 'ip.sb' | 'ipwho.is' | 'ipapi.is'
   networkInfoCardOrder?: NetworkInfoCardKey[]

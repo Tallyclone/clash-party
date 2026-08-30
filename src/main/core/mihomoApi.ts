@@ -258,6 +258,90 @@ export const mihomoProxies = async (): Promise<IMihomoProxies> => {
   return proxies
 }
 
+export interface IMihomoProxyDetailResult {
+  /** 查到的节点或策略组；未查到时为 null */
+  proxy: IMihomoProxy | IMihomoGroup | null
+  /** 内核明确表示该名字不存在（已含全量兜底复核，可放心回 404） */
+  notFound: boolean
+  /** 非 200 / 非 404 的失败原因；成功或 notFound 时为空 */
+  error: string
+}
+
+/**
+ * 按名字查单个节点/策略组。
+ *
+ * ## 为什么要有它
+ *
+ * 只需要一个组的地方以前都走 `mihomoProxies()` 拉全量。实测（mihomo v1.19.29，
+ * 643 节点 + 174 策略组的真实配置）两者差三个数量级：
+ *
+ * ```
+ * GET /proxies              5.11 MB   net 247~306ms   JSON.parse 24~52ms
+ * GET /proxies/出口能用01   28034 B   net 1~4ms       JSON.parse 0ms
+ * ```
+ *
+ * `JSON.parse` 是主进程里的**同步**调用，期间所有 IPC 排队 —— 主进程同时是渲染进程
+ * 全部 invoke 的服务端，一卡就表现为界面点了没反应。单组查询把这笔开销直接消掉。
+ *
+ * 已核实单组响应的字段集与全量 `/proxies` 里的同名对象**逐项一致**
+ * （`name`/`type`/`now`/`fixed`/`all`，`all[]` 顺序也一致），所以调用方可以原样替换。
+ *
+ * ## 为什么 404 还要再拉一次全量
+ *
+ * 内核对「名字不存在」和「压根没有这个路由」都回 `404 {"message":"Resource not found"}`，
+ * 光看响应无法区分。若某个内核版本真的没有这条路由，直接把 404 当成「组不存在」
+ * 会让所有单组请求集体误报。所以 404 时用 `mihomoProxies()` 复核一次再下结论：
+ * 命中的热路径拿到全部收益，误报只可能发生在本来就要报错的冷路径上，
+ * 而那条路径的代价与改动前完全相同。
+ */
+export const mihomoProxyDetail = async (name: string): Promise<IMihomoProxyDetailResult> => {
+  const fallback = async (): Promise<IMihomoProxyDetailResult> => {
+    try {
+      const proxies = await mihomoProxies()
+      const proxy = proxies.proxies[name]
+      return { proxy: proxy ?? null, notFound: !proxy, error: '' }
+    } catch (error) {
+      return {
+        proxy: null,
+        notFound: false,
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  }
+
+  try {
+    const instance = await getProbeAxios()
+    const response = await instance.get(`/proxies/${encodeURIComponent(name)}`, {
+      // 单组响应只有几十 KB，给 5 秒足够；不沿用探测实例的 30 秒兜底值，
+      // 免得内核卡住时把脚本 API 的请求一起吊死。
+      timeout: 5000
+    })
+
+    if (response.status === 200) {
+      const data = response.data as (IMihomoProxy | IMihomoGroup) | undefined
+      // 名字字段缺失说明拿到的不是预期结构（例如被中间层改写过），退回全量以免误判
+      if (data && typeof (data as { name?: unknown }).name === 'string') {
+        return { proxy: data, notFound: false, error: '' }
+      }
+      return await fallback()
+    }
+
+    if (response.status === 404) {
+      return await fallback()
+    }
+
+    const message = (response.data as { message?: unknown } | undefined)?.message
+    return {
+      proxy: null,
+      notFound: false,
+      error: typeof message === 'string' && message ? message : `HTTP ${response.status}`
+    }
+  } catch {
+    // socket 层异常（内核正在重启等）也退回全量，让它走原有的错误路径
+    return await fallback()
+  }
+}
+
 function isMihomoGroup(proxy: IMihomoProxy | IMihomoGroup | undefined): proxy is IMihomoGroup {
   return Boolean(proxy && 'all' in proxy)
 }
@@ -379,9 +463,80 @@ export const mihomoGroups = async (includeHidden = false): Promise<IMihomoMixedG
   return groups
 }
 
+/**
+ * 从 runtime config 里取「真订阅」provider 的名字。
+ *
+ * mihomo 的 `proxy-providers` 段是**唯一**会产生非 `Compatible` provider 的来源；
+ * 内核额外暴露的那些 `vehicleType: "Compatible"` 条目其实是 proxy-group 的镜像，
+ * 两个界面调用方（usage-card / proxy-provider）都在渲染时把它们 filter 掉了。
+ */
+const resolveSubscriptionProviderNames = async (): Promise<string[]> => {
+  try {
+    const runtime = (await getRuntimeConfig()) as unknown as
+      | { 'proxy-providers'?: Record<string, unknown> }
+      | undefined
+    const declared = runtime?.['proxy-providers']
+    if (!declared || typeof declared !== 'object') return []
+    return Object.keys(declared).filter((name) => typeof name === 'string' && name.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 获取订阅型 proxy provider 列表。
+ *
+ * ## 为什么不直接打 `GET /providers/proxies`
+ *
+ * 实测（mihomo v1.19.29，643 节点 + 150 个脚本出口组的真实配置）：
+ *
+ * ```
+ * GET /providers/proxies   148.52 MB   net 7021~9920ms   JSON.parse 1574~2825ms
+ *   providers 总数 174，全部 vehicleType = "Compatible"
+ *   ├─ 出口能用NN 组      150 个  138.77 MB   ← 93%
+ *   ├─ 其他 Compatible 组  24 个    9.75 MB
+ *   └─ 真订阅 provider      0 个    0.00 MB   ← 界面真正需要的只有这一类
+ * ```
+ *
+ * 原因是 mihomo 把**每个 proxy-group 也当成 `vehicleType: "Compatible"` 的 provider**
+ * 暴露，而且每个 provider 的 `proxies[]` 装的是**完整节点对象**（不是名字），
+ * 于是「组数 × 成员数」被完整地物化了一遍。
+ *
+ * 更糟的是 `usage-card` 里这个 SWR key 没传任何 options，走 SWR 默认
+ * `revalidateOnFocus: true`，而 usage 卡片在侧边栏常驻挂载 —— 等于**每次窗口获得焦点**
+ * 就让主进程拉 148 MB、做一次 1.5~2.8 秒的**同步** `JSON.parse`（期间所有 IPC 排队），
+ * 再经 structured clone 送进渲染进程。日志里 `Main window unresponsive` 一天 37 次，
+ * 基本可以由这一条单独解释。
+ *
+ * ## 改法与等价性
+ *
+ * 从 runtime config 的 `proxy-providers` 段取真订阅名单，逐个打
+ * `GET /providers/proxies/{name}`（已实测字段集与全量列表里的同名条目完全一致：
+ * `expectedStatus / name / proxies / testUrl / type / updatedAt / vehicleType`）。
+ *
+ * 可见行为不变：丢掉的全是 `Compatible` 条目，而两个调用方本来就 filter 掉了它们。
+ * 已知的偏差只有一处 —— 订阅刚更新、runtime config 与内核状态差一拍时，
+ * 资源页可能少显示一个 provider，下次刷新即恢复。
+ */
 export const mihomoProxyProviders = async (): Promise<IMihomoProxyProviders> => {
-  const instance = await getAxios()
-  return await instance.get('/providers/proxies')
+  const names = await resolveSubscriptionProviderNames()
+  // 没有声明订阅型 provider 时一个网络请求都不发（用户的实际配置正是这种情况）
+  if (names.length === 0) return { providers: {} }
+
+  const settled = await Promise.allSettled(names.map((name) => mihomoProxyProvider(name)))
+  const providers: Record<string, IMihomoProxyProvider> = {}
+  settled.forEach((result, index) => {
+    if (result.status !== 'fulfilled') {
+      // 单个 provider 查不到（刚被移除、内核还没 reload 等）只跳过它，
+      // 不能让整个列表失败 —— 否则资源页会整片空白。
+      mihomoApiLogger.warn(`fetch proxy provider failed: ${names[index]}`)
+      return
+    }
+    const provider = result.value
+    if (!provider || typeof provider.name !== 'string' || !provider.name) return
+    providers[provider.name] = provider
+  })
+  return { providers }
 }
 
 export const mihomoUpdateProxyProviders = async (name: string): Promise<void> => {
@@ -419,9 +574,14 @@ export const mihomoProxyDelay = async (
   url?: string,
   provider?: string,
   /**
-   * 覆盖本次测速的超时（毫秒）。延迟探测模块用它把现测压到 1 秒级：
-   * 慢于判定阈值的节点反正要被筛掉，没必要等满全局的 5 秒。
-   * 不传则沿用设置页的「测速超时」，保持手动测速行为不变。
+   * 覆盖本次测速的超时（毫秒）。
+   *
+   * ⚠ 不要再用它去「压短等待时间」。mihomo 的 timeout 覆盖的是
+   * 【dial + TLS 握手 + 两次 HEAD】的整条链路，而上报的 delay 只是
+   * 最后一次 HEAD 的单程 RTT，实测墙钟/上报比值 p50=7.2、p90=16.9。
+   * 把 timeout 压到 1200ms 等于偷偷要求「整链 ≤1200ms」≈「RTT ≤200ms」，
+   * 实测会把召回率从 89.5%（@5000）打到 15.8%（@1200），
+   * 并把大量健康节点写成 delay=0。详见 appConfig.ts 的 DELAY_PROBE_TIMEOUT 注释。
    */
   timeoutOverride?: number
 ): Promise<IMihomoDelay> => {
@@ -433,10 +593,88 @@ export const mihomoProxyDelay = async (
     : `/proxies/${encodeURIComponent(proxy)}/delay`
   return await instance.get(path, {
     params: {
-      url: delayTestUrl || url || 'https://www.gstatic.com/generate_204',
+      // 调用方显式指定的 url 优先：策略组自带的 testUrl（proxies.tsx / tray.ts 会传）
+      // 比全局设置更贴近该组的实际用途。原先写成 `delayTestUrl || url`，
+      // 只要用户在设置页填了全局测速地址，per-group testUrl 就被无条件盖掉。
+      url: url || delayTestUrl || 'https://www.gstatic.com/generate_204',
       timeout: timeoutOverride || delayTestTimeout || 5000
     }
   })
+}
+
+/**
+ * 探测专用 axios 实例。
+ *
+ * 为什么不复用 getAxios()：getAxios() 装了全局响应拦截器，成功时把 response
+ * 降级成 response.data，失败时 reject(error.response.data) —— HTTP status 被丢掉了。
+ * 而延迟探测必须区分 504（deadline 截断，超时）和 503（真的连不上落地），
+ * 这两种在 body 里长得几乎一样（都只有一个 message 字段）。
+ *
+ * 那个拦截器被 700 多行文件里几十个调用方依赖，改它风险远大于收益，
+ * 所以这里另起一个不装拦截器、validateStatus 全通过的实例，自己读 status。
+ */
+let probeAxiosIns: AxiosInstance | null = null
+let probeAxiosIpcPath: string = ''
+
+export const getProbeAxios = async (force: boolean = false): Promise<AxiosInstance> => {
+  const dynamicIpcPath = getMihomoIpcPath()
+
+  if (probeAxiosIns && !force && probeAxiosIpcPath === dynamicIpcPath) {
+    return probeAxiosIns
+  }
+
+  probeAxiosIpcPath = dynamicIpcPath
+  probeAxiosIns = axios.create({
+    baseURL: `http://localhost`,
+    socketPath: dynamicIpcPath,
+    // 比内核 timeout 留足余量：内核到点会自己返回 504，
+    // 这里的 timeout 只是兜底防止 socket 卡死，不参与判定。
+    timeout: 30000,
+    // 关键：4xx/5xx 不抛异常，让调用方拿到 status 自己判。
+    validateStatus: () => true
+  })
+
+  return probeAxiosIns
+}
+
+export interface IMihomoProbeResult {
+  /** HTTP 状态码；0 表示请求根本没发出去（socket 层异常） */
+  status: number
+  /** 内核上报的延迟；只有 status=200 时有意义 */
+  delay: number
+  /** 内核给的错误描述，或 axios 的异常信息 */
+  message: string
+}
+
+/**
+ * 单节点测速（探测专用）。与 mihomoProxyDelay 的区别：
+ * - 返回 HTTP status，让调用方能把 504/503/其它区分成不同 err 码
+ * - 永不抛异常（socket 层异常也归一成 status=0）
+ * - url / timeout 全部由调用方显式给定，不读设置页，避免用户改设置影响探测判据
+ */
+export const mihomoProbeDelay = async (
+  proxy: string,
+  url: string,
+  timeout: number
+): Promise<IMihomoProbeResult> => {
+  try {
+    const instance = await getProbeAxios()
+    const response = await instance.get(`/proxies/${encodeURIComponent(proxy)}/delay`, {
+      params: { url, timeout }
+    })
+    const data = (response.data ?? {}) as { delay?: number; message?: string }
+    return {
+      status: response.status,
+      delay: typeof data.delay === 'number' && Number.isFinite(data.delay) ? data.delay : 0,
+      message: typeof data.message === 'string' ? data.message : ''
+    }
+  } catch (error) {
+    return {
+      status: 0,
+      delay: 0,
+      message: error instanceof Error ? error.message : String(error)
+    }
+  }
 }
 
 export const mihomoGroupDelay = async (group: string, url?: string): Promise<IMihomoGroupDelay> => {
@@ -445,7 +683,8 @@ export const mihomoGroupDelay = async (group: string, url?: string): Promise<IMi
   const instance = await getAxios()
   return await instance.get(`/group/${encodeURIComponent(group)}/delay`, {
     params: {
-      url: delayTestUrl || url || 'https://www.gstatic.com/generate_204',
+      // 与 mihomoProxyDelay 一致：调用方给的 per-group testUrl 优先于全局设置。
+      url: url || delayTestUrl || 'https://www.gstatic.com/generate_204',
       timeout: delayTestTimeout || 5000
     }
   })
@@ -482,6 +721,16 @@ export const mihomoHotReloadConfig = async (): Promise<void> => {
     return
   }
   mihomoApiLogger.info('hot reload config completed')
+  // 热重载没有走 restartCore，manager 里那条 core-ready 通知不会触发，必须在这里补一次：
+  // 工位 listener 可能刚被注入/移除（端口预检结果失效），节点名也可能整批变了
+  // （probeStore 不落盘且只装被点名过的节点，不重跑基线会让脚本拿到空名单）。
+  // 动态 import 避免 mihomoApi ↔ probeStation/delayProbe 的静态循环依赖。
+  try {
+    const { notifyProbeConfigReloaded } = await import('./probeStation')
+    notifyProbeConfigReloaded('config-hot-reload')
+  } catch (error) {
+    mihomoApiLogger.warn('Failed to notify probe modules after hot reload', error)
+  }
   try {
     const { scheduleRuntimeConfigUpload } = await import('../resolve/gistApi')
     scheduleRuntimeConfigUpload()

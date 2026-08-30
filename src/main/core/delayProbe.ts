@@ -1,21 +1,24 @@
 import { Cron } from 'croner'
 import {
-  DELAY_PROBE_CANDIDATE_HISTORY_COUNT,
-  DELAY_PROBE_CANDIDATE_MAX_AGE_MS,
-  DELAY_PROBE_CANDIDATE_MAX_DELAY,
   DELAY_PROBE_FULL_CONCURRENCY,
   DELAY_PROBE_FULL_INTERVAL_MINUTES,
-  DELAY_PROBE_FULL_TIMEOUT,
-  DELAY_PROBE_QUICK_CONCURRENCY,
-  DELAY_PROBE_QUICK_TIMEOUT,
   DELAY_PROBE_STARTUP_DELAY_MS,
+  DELAY_PROBE_TIMEOUT,
   SCRIPT_API_NAMED_PROBE_CONCURRENCY,
-  SCRIPT_API_NAMED_PROBE_MAX_NAMES,
-  SCRIPT_API_NAMED_PROBE_MAX_TIMEOUT,
-  SCRIPT_API_NAMED_PROBE_MIN_TIMEOUT
+  SCRIPT_API_NAMED_PROBE_MAX_NAMES
 } from '../../shared/appConfig'
+import { getAppConfig } from '../config'
 import { createLogger } from '../utils/logger'
-import { mihomoProxies, mihomoProxyDelay } from './mihomoApi'
+import { mihomoProbeDelay, mihomoProxies } from './mihomoApi'
+import {
+  getFreshDelayRecord,
+  getRecordAgeMs,
+  IProbeDelayRecord,
+  ProbeErrCode,
+  pruneDelayRecords,
+  recordDelayResult,
+  resolveProbeMaxAgeMs
+} from './probeStore'
 
 const probeLogger = createLogger('delay-probe')
 
@@ -26,17 +29,27 @@ const probeLogger = createLogger('delay-probe')
  * 因此它成员的延迟历史长期是空的。而「隐藏慢节点」和「脚本控制 API 只给能用的节点」
  * 这两件事都要读延迟数字才能成立 —— 数字必须有人去测，这个模块就是唯一负责测的地方。
  *
- * 两种工作：
- * - 全量基线：每 DELAY_PROBE_FULL_INTERVAL_MINUTES 分钟把所有具体节点测一遍。
- *   没人等它，超时给得宽，目的是让代理页面随时有数字可看。这是唯一的固定开销。
- * - 现测（quick）：脚本请求名单且数据已经太旧时临时触发。只测「最近还达标过」的候选，
- *   超时压到略高于判定阈值，因此通常 1 秒级就能返回。
+ * ## 两层结构（一张表、两种新鲜度门槛）
  *
- * 候选池判定回看最近若干条 history（见 isProbeCandidate），不是只看最后一条 ——
- * 只看最后一条会让一次失败等于永久除名，实测有 22% 的节点处于抖动状态，会被大量误杀。
+ * - **基线全量**：3 小时一轮 + 启动/订阅更新/配置切换事件触发。职责是**保全组覆盖**，
+ *   不是保新鲜。没人等它。
+ * - **lazy refresh**：`POST /probe mode=delay` 按脚本点名的节点现测，职责是**保新鲜**
+ *   （默认 300 秒门槛）。脚本同步等它。
  *
- * 延迟数字本身不在这里缓存 —— 它由内核记在每个节点的 history 上，
- * 读 `/proxies` 就是最新值。这里只记录「最近一次探测是什么时候」，用于判断数据新鲜度。
+ * 两者写同一张表（probeStore），读取方按自己的门槛决定够不够新。
+ *
+ * ## 三条不变量（改动前请读完，每条都是踩过的坑）
+ *
+ * 1. **测量给足、判定分离**：内核测速的 timeout 恒为 DELAY_PROBE_TIMEOUT，
+ *    脚本传的 maxDelay 只在**结果上过滤**，绝不反向影响测量参数。
+ *    历史 bug：quick 档把 timeout 压到 1200ms 想"快点返回"，实测召回率 15.8%
+ *    （给足 5000ms 是 89.5%）。原因见 appConfig 的 DELAY_PROBE_TIMEOUT 注释。
+ * 2. **判据不读内核 history**：history 只有 10 条、delay=0 有三义、504 还会往里
+ *    写正数假延迟。所有判定改读 probeStore（原因见 probeStore.ts 文件头）。
+ * 3. **没有候选池、没有 quick 档**。候选池（"最近还达标过的才值得测"）是自我强化的
+ *    负反馈：实测连跑 4 轮后池子从 175 掉到 108（−38%），因为它的时间窗 =
+ *    N × 探测周期，频率一高窗口就塌。lazy refresh 让"该测什么"直接由脚本的真实
+ *    需求定义，不需要任何启发式。
  */
 
 /** 这些内置出口没有测速意义 */
@@ -46,7 +59,7 @@ const SKIP_PROXY_NAMES = new Set([
   'REJECT-DROP',
   'PASS',
   // 实测内核还会暴露一个 PASS-RULE（type=PassRule）：它永远测不通，
-  // 漏掉它等于每轮全量都白占一个 DELAY_PROBE_FULL_TIMEOUT 的槽位
+  // 漏掉它等于每轮全量都白占一个 DELAY_PROBE_TIMEOUT 的槽位
   'PASS-RULE',
   'COMPATIBLE',
   'GLOBAL'
@@ -64,16 +77,35 @@ const SKIP_PROXY_TYPES = new Set([
   'dns'
 ])
 
+/** 内核默认的 204 探测地址。实测它不是本项目召回率低的原因，换成别的 https 目标差异在抖动范围内 */
+export const DEFAULT_PROBE_URL = 'https://www.gstatic.com/generate_204'
+
+/**
+ * 这个名字值不值得测。基线、名单探测、工位拨测三处共用同一口径，不要各写一份。
+ *
+ * 排除策略组：测一个组等于测它当前选中的那个节点，会重复且结果归属不清。
+ */
+export function isProbeableProxy(
+  name: string,
+  proxy: IMihomoProxy | IMihomoGroup | undefined
+): boolean {
+  if (!proxy) return false
+  if ('all' in proxy) return false
+  if (SKIP_PROXY_NAMES.has(name)) return false
+  if (SKIP_PROXY_TYPES.has(String(proxy.type ?? '').toLowerCase())) return false
+  return true
+}
+
 export interface IDelayProbeSnapshot {
-  /** 最近一次探测（全量或现测）完成的时间戳，毫秒。从未探测过为 null */
+  /** 最近一次基线完成的时间戳，毫秒。从未探测过为 null */
   lastProbeAt: number | null
-  /** 最近一次全量基线完成的时间戳，毫秒 */
+  /** 最近一次全量基线完成的时间戳，毫秒（与 lastProbeAt 同义，保留字段名兼容脚本） */
   lastFullProbeAt: number | null
-  /** 最近一次探测覆盖的节点数 */
+  /** 最近一次基线覆盖的节点数 */
   lastProbedCount: number
-  /** 最近一次探测中测出可用（延迟大于 0）的节点数 */
+  /** 最近一次基线中测出可用（延迟大于 0）的节点数 */
   lastAliveCount: number
-  /** 是否有探测正在进行 */
+  /** 是否有基线正在进行 */
   probing: boolean
 }
 
@@ -86,7 +118,7 @@ const state = {
 
 let fullProbeCron: Cron | null = null
 let startupTimer: NodeJS.Timeout | null = null
-/** 同一时刻只允许一个探测在跑，后来的调用复用同一个 Promise，避免脚本并发把机场打爆 */
+/** 同一时刻只允许一轮基线在跑，后来的调用复用同一个 Promise，避免事件密集触发时叠加 */
 let inflightProbe: Promise<void> | null = null
 
 export function getDelayProbeSnapshot(): IDelayProbeSnapshot {
@@ -99,233 +131,77 @@ export function getDelayProbeSnapshot(): IDelayProbeSnapshot {
   }
 }
 
-/** 数据年龄（毫秒）。从未探测过返回 null */
+/** 基线数据年龄（毫秒）。从未探测过返回 null */
 export function getDelayDataAgeMs(): number | null {
   if (state.lastProbeAt === null) return null
   return Date.now() - state.lastProbeAt
 }
 
-interface IProbeTargets {
-  names: string[]
-  /** 节点名 -> 最近若干条延迟记录（内核 history 的尾部切片，按时间升序） */
-  histories: Map<string, IMihomoHistory[]>
+/** 只接受能解析出 http/https 的地址，其余当没传 —— 否则一个手滑的配置会让整轮探测全灭 */
+function sanitizeProbeUrl(input: unknown): string | null {
+  if (typeof input !== 'string') return null
+  const value = input.trim()
+  if (!value) return null
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return value
+  } catch {
+    return null
+  }
 }
 
 /**
- * 这个节点还值不值得花一个现测槽位。
+ * 决定这次探测打哪个地址。优先级：脚本传的 > 设置页的探测地址 > 设置页的测速地址 > 内置默认。
  *
- * 判定口径：最近 count 条记录里存在一条「延迟达标且不算太旧」的成绩。
- *
- * 为什么要回看多条而不是只看最后一条：现测超时压到了 1200ms，内核会把超时记成
- * delay 0（与「连不上」无法区分），于是一个真实延迟抖到 1300ms 的健康节点会被
- * 记成 0 → 出候选池 → 之后所有现测都不再碰它 → 只能等下一轮全量捞回来。
- * 实测 426 个节点的订阅里有 94 个（22%）处于「最近 3 条既有失败又有达标」的抖动状态。
- *
- * 时间解析失败时**不因此排除**：`history[].time` 由内核给出（实测是带时区偏移的
- * RFC3339），万一某个版本/平台格式变了，严格判断会让候选池恒空，
- * 于是每轮现测都退化成测全部节点 —— 那是比放宽严重得多的故障。
- *
- * ⚠ 注意与 scriptApiServer 的 isUsable() 分工：这里回答「要不要测它」，看最近多条；
- * 那里回答「要不要把它给脚本」，只看最后一条。两者故意不一致，**不要对齐** ——
- * 对齐会让脚本拿到实际已经挂掉的节点，直接违背这套过滤存在的意义。
- * 因此「节点在候选池里、每轮都被测，但因为最后一条是 0 而不进名单」是预期状态。
+ * ⚠ 不要换成明文 http 去省 TLS 握手流量：同一批节点 @timeout=6000 实测
+ * https 版 504 只有 16~17 个（alive 82~89%），明文 http 版 504 是 47 个（alive 64.2%）。
+ * 部分落地机对明文 http 出站有限制，这条路是死的。
  */
-export function isProbeCandidate(
-  history: IMihomoHistory[] | undefined,
-  now: number = Date.now(),
-  options: { count?: number; maxAgeMs?: number } = {}
-): boolean {
-  if (!Array.isArray(history) || history.length === 0) return false
-
-  const count = options.count ?? DELAY_PROBE_CANDIDATE_HISTORY_COUNT
-  const maxAgeMs = options.maxAgeMs ?? DELAY_PROBE_CANDIDATE_MAX_AGE_MS
-
-  return history.slice(-count).some((record) => {
-    if (!record || typeof record.delay !== 'number') return false
-    if (record.delay <= 0 || record.delay > DELAY_PROBE_CANDIDATE_MAX_DELAY) return false
-    const time = Date.parse(record.time)
-    return Number.isNaN(time) || now - time <= maxAgeMs
-  })
+export async function resolveProbeUrl(input?: unknown): Promise<string> {
+  const fromScript = sanitizeProbeUrl(input)
+  if (fromScript) return fromScript
+  try {
+    const { probeTestUrl, delayTestUrl } = await getAppConfig()
+    return sanitizeProbeUrl(probeTestUrl) ?? sanitizeProbeUrl(delayTestUrl) ?? DEFAULT_PROBE_URL
+  } catch {
+    return DEFAULT_PROBE_URL
+  }
 }
 
-/** 「只看最后一条」的旧口径。仅用于日志里算出有多少节点是靠回看留下来的 */
-function hasUsableLastRecord(history: IMihomoHistory[] | undefined): boolean {
-  if (!Array.isArray(history) || history.length === 0) return false
-  const last = history[history.length - 1]
-  return (
-    !!last &&
-    typeof last.delay === 'number' &&
-    last.delay > 0 &&
-    last.delay <= DELAY_PROBE_CANDIDATE_MAX_DELAY
-  )
-}
-
-async function collectProbeTargets(): Promise<IProbeTargets> {
+async function collectProbeTargets(): Promise<string[]> {
   const proxies = await mihomoProxies()
   const names: string[] = []
-  const histories = new Map<string, IMihomoHistory[]>()
 
   for (const [name, proxy] of Object.entries(proxies.proxies ?? {})) {
-    if (!proxy) continue
-    // 策略组不测：测一个组等于测它当前选中的那个节点，会重复且结果归属不清
-    if ('all' in proxy) continue
-    if (SKIP_PROXY_NAMES.has(name)) continue
-    if (SKIP_PROXY_TYPES.has(String(proxy.type ?? '').toLowerCase())) continue
-
-    names.push(name)
-    const history = proxy.history
-    // 只留尾部若干条：候选池判定用不到更早的（内核每个节点最多也只给 10 条）
-    histories.set(
-      name,
-      Array.isArray(history) ? history.slice(-DELAY_PROBE_CANDIDATE_HISTORY_COUNT) : []
-    )
+    if (isProbeableProxy(name, proxy)) names.push(name)
   }
 
-  return { names, histories }
+  return names
 }
 
 /**
- * 并发跑一批测速。返回测出可用（延迟大于 0）的节点数。
+ * HTTP 状态码 → 失败原因。
  *
- * 单个节点失败一律吞掉：节点连不上是常态，内核会把它记成延迟 0，
- * 这本身就是我们要的信息，没必要往上抛。
- */
-async function probeNames(names: string[], timeout: number, concurrency: number): Promise<number> {
-  let alive = 0
-  const running: Promise<void>[] = []
-
-  for (const name of names) {
-    const task = mihomoProxyDelay(name, undefined, undefined, timeout)
-      .then((res) => {
-        if (res && typeof res.delay === 'number' && res.delay > 0) alive += 1
-      })
-      .catch(() => {})
-
-    const tracked: Promise<void> = task.then(() => {
-      const index = running.indexOf(tracked)
-      if (index >= 0) running.splice(index, 1)
-    })
-    running.push(tracked)
-
-    if (running.length >= Math.max(1, concurrency)) {
-      await Promise.race(running)
-    }
-  }
-
-  await Promise.all(running)
-  return alive
-}
-
-async function runProbe(scope: 'full' | 'quick'): Promise<void> {
-  const startedAt = Date.now()
-  const { names, histories } = await collectProbeTargets()
-
-  if (names.length === 0) {
-    probeLogger.warn('No probeable proxies found, skipping')
-    return
-  }
-
-  let targets = names
-  let timeout = DELAY_PROBE_FULL_TIMEOUT
-  let concurrency = DELAY_PROBE_FULL_CONCURRENCY
-  let rescued = 0
-
-  if (scope === 'quick') {
-    timeout = DELAY_PROBE_QUICK_TIMEOUT
-    concurrency = DELAY_PROBE_QUICK_CONCURRENCY
-    // 候选池：最近若干条 history 里还达标过的节点。
-    // 一个都没有（例如刚启动、从未测过，或整体断网连挂数轮）时退化成测全部，
-    // 否则名单会永远是空的。
-    const candidates = names.filter((name) => isProbeCandidate(histories.get(name), startedAt))
-    // 其中有多少是靠回看留下来的（旧口径只看最后一条，会把它们剔掉）。
-    // 没有这个计数就没法判断回看机制到底有没有在起作用。
-    rescued = candidates.filter((name) => !hasUsableLastRecord(histories.get(name))).length
-    targets = candidates.length > 0 ? candidates : names
-  }
-
-  const alive = await probeNames(targets, timeout, concurrency)
-
-  const now = Date.now()
-  state.lastProbeAt = now
-  state.lastProbedCount = targets.length
-  state.lastAliveCount = alive
-  if (scope === 'full') state.lastFullProbeAt = now
-
-  probeLogger.info(
-    `${scope} probe done: ${alive}/${targets.length} alive in ${now - startedAt}ms` +
-      (scope === 'quick'
-        ? targets.length === names.length
-          ? ` (candidate pool empty, fell back to all ${names.length})`
-          : ` (candidates out of ${names.length}, ${rescued} kept by history look-back)`
-        : '')
-  )
-}
-
-/** 串行化探测：已有探测在跑时直接复用，不叠加请求 */
-function runProbeExclusive(scope: 'full' | 'quick'): Promise<void> {
-  if (inflightProbe) return inflightProbe
-  inflightProbe = runProbe(scope)
-    .catch((e) => {
-      probeLogger.warn(`Failed to run ${scope} delay probe`, e)
-    })
-    .finally(() => {
-      inflightProbe = null
-    })
-  return inflightProbe
-}
-
-/** 手动触发一次全量基线，供脚本控制 API 的 /probe 使用 */
-export async function probeAllProxies(): Promise<IDelayProbeSnapshot> {
-  await runProbeExclusive('full')
-  return getDelayProbeSnapshot()
-}
-
-/** 手动触发一次现测，供脚本控制 API 的 /probe 使用 */
-export async function probeCandidateProxies(): Promise<IDelayProbeSnapshot> {
-  await runProbeExclusive('quick')
-  return getDelayProbeSnapshot()
-}
-
-/**
- * 保证延迟数据不超过 maxAgeMs。数据够新则什么都不做。
+ * 504 与 503 的区分是这次改造的核心收益之一：@1200 时 97 个样本里 75 个是 504
+ * （被 deadline 截断，节点其实健康），只有 16 个是 503（真连不上）。
+ * 旧代码把两者一起记成 delay=0，于是"极度保守"的原因完全看不出来。
  *
- * @returns 本次是否真的触发了探测
+ * status=0 是 socket 层就没通（内核没起来 / 管道断了），归到 kernel_error：
+ * 它和节点质量无关，不该让脚本以为节点坏了。
  */
-export async function ensureFreshDelays(maxAgeMs: number): Promise<boolean> {
-  const age = getDelayDataAgeMs()
-  if (age !== null && age <= maxAgeMs) return false
-  await runProbeExclusive('quick')
-  return true
-}
-
-/** 名单探测的结果。计数字段的用途是让脚本知道自己传的名单被怎么处理了 */
-export interface INamedProbeResult {
-  /** 实际测过的节点，顺序与传入名单一致 */
-  results: { name: string; delay: number }[]
-  /** 内核里查不到的名字。订阅更新后失效的旧名字通常落在这里 */
-  unknown: string[]
-  /** 拒测的名字：策略组，或 DIRECT/REJECT 这类内置出口 */
-  rejected: string[]
-  /** 传进来多少个（含重复与非法项） */
-  received: number
-  /** 去重后剩多少个 */
-  deduped: number
-  /** 校验通过、真正参与测速的有多少个 */
-  accepted: number
-  /** 因为超过名单上限被截掉多少个 */
-  truncated: number
-  /** 测出可用（延迟大于 0）的数量 */
-  aliveCount: number
-  /** 本次实际生效的超时（毫秒），已按上下限收敛 */
-  timeout: number
-  elapsedMs: number
+function classifyProbeStatus(status: number): ProbeErrCode | null {
+  if (status === 200) return null
+  if (status === 504) return 'timeout'
+  if (status === 503) return 'unreachable'
+  return 'kernel_error'
 }
 
 /**
  * 名单探测的全局并发闸门。
  *
- * 为什么不复用 probeNames() 的滑动窗口：那个窗口是**每次调用**各自一个，
- * 两个请求同时进来就是两倍并发。这里要的是跨请求共享的总量上限，只能用信号量。
+ * 为什么要信号量而不是每次调用各自开个滑动窗口：后者两个请求同时进来就是两倍并发。
+ * 这里要的是跨请求共享的总量上限。
  *
  * 交接名额而不是「先减计数再让下一个抢」：后者中间有个计数为空的窗口，
  * 会被同一 tick 里的其他 acquire 插队，导致实际并发超过上限。
@@ -349,71 +225,224 @@ function releaseNamedProbeSlot(): void {
   else namedProbeInflight -= 1
 }
 
-/** 同名去重：同一个节点 + 同一个超时正在测时，后来者复用同一个 Promise */
-const namedProbeByKey = new Map<string, Promise<number>>()
+/**
+ * 在飞去重表。
+ *
+ * key 是 `name + url`，**不含 timeout 也不含 maxDelay**：
+ * - timeout 已经固定成 DELAY_PROBE_TIMEOUT，不再是变量；
+ * - maxDelay 只用于过滤结果，不影响测出来的数值，所以两个脚本传不同 maxDelay
+ *   查同一个节点时应该共享同一次探测（旧代码 key 里带 timeout，做不到）；
+ * - url 必须进 key：换了测速地址测的就是另一件事，让它们互相冒充会给出错误答案。
+ */
+const inflightByKey = new Map<string, Promise<IProbeDelayRecord>>()
 
 /**
- * 测一个节点，返回延迟（失败一律 0，与内核记 history 的口径一致）。
+ * 测一个节点并把结果写进 probeStore。永不抛异常。
  *
- * 超时进 key 是必须的：不同超时测出来的是不同的东西（1200ms 下的 0 可能只是慢），
- * 让它们互相冒充会给出错误答案。
+ * useSharedSlot=false 供基线使用：基线自己有滑动窗口（DELAY_PROBE_FULL_CONCURRENCY），
+ * 不占名单探测的名额，两者最坏叠加见 appConfig 里 SCRIPT_API_NAMED_PROBE_CONCURRENCY 的注释。
  */
-function probeOneNamed(name: string, timeout: number): Promise<number> {
-  const key = `${name}\u0000${timeout}`
-  const existing = namedProbeByKey.get(key)
+function probeOne(name: string, url: string, useSharedSlot: boolean): Promise<IProbeDelayRecord> {
+  const key = `${name}\u0000${url}`
+  const existing = inflightByKey.get(key)
   if (existing) return existing
 
   const task = (async () => {
-    // 名额在这里排队而不是在调用方排队，这样后来的同名请求能直接复用，不额外占名额
-    await acquireNamedProbeSlot()
+    if (useSharedSlot) await acquireNamedProbeSlot()
     try {
-      const res = await mihomoProxyDelay(name, undefined, undefined, timeout)
-      return typeof res?.delay === 'number' && res.delay > 0 ? res.delay : 0
-    } catch {
-      // 节点连不上是常态，内核那边已经记成 0 了，这里不往上抛
-      return 0
+      const res = await mihomoProbeDelay(name, url, DELAY_PROBE_TIMEOUT)
+      const err = classifyProbeStatus(res.status)
+      // err 非 null 时不要相信 body 里的 delay：504 的响应体里可能带着一个
+      // 顶到 timeout 的假延迟（天花板产物），交给 probeStore 归一也行，
+      // 但这里直接置 0 更明确。
+      return recordDelayResult(name, { delay: err ? 0 : res.delay, err, url })
+    } catch (e) {
+      probeLogger.debug(`probe ${name} failed unexpectedly`, e)
+      return recordDelayResult(name, { delay: 0, err: 'kernel_error', url })
     } finally {
-      releaseNamedProbeSlot()
+      if (useSharedSlot) releaseNamedProbeSlot()
     }
   })()
 
   const tracked = task.finally(() => {
-    namedProbeByKey.delete(key)
+    inflightByKey.delete(key)
   })
-  namedProbeByKey.set(key, tracked)
+  inflightByKey.set(key, tracked)
   return tracked
 }
 
+/** 滑动窗口并发执行。基线用，不走信号量 */
+async function runWithWindow(
+  names: string[],
+  concurrency: number,
+  task: (name: string) => Promise<unknown>
+): Promise<void> {
+  const running: Promise<void>[] = []
+
+  for (const name of names) {
+    const tracked: Promise<void> = task(name)
+      .catch(() => {})
+      .then(() => {
+        const index = running.indexOf(tracked)
+        if (index >= 0) running.splice(index, 1)
+      })
+    running.push(tracked)
+
+    if (running.length >= Math.max(1, concurrency)) {
+      await Promise.race(running)
+    }
+  }
+
+  await Promise.all(running)
+}
+
 /**
- * 按脚本给定的名单现测，返回逐节点延迟。供脚本控制 API 的 `POST /probe` 使用。
+ * 全量基线：把所有具体节点测一遍，写进 probeStore。
  *
- * 与全量/现测的三条关键区别，改动时不要「顺手统一」：
+ * 为什么这一层不能省（自锁论证）：表里只有"曾被点名过的节点"。没被基线测过的节点
+ * 在 isUsable() 里恒为 false → 不出现在 GET /groups 的名单 → 脚本拿不到它的名字 →
+ * 永远不会去 POST /probe 点它 → 永远不进表。这个死锁不会自愈。
+ */
+async function runFullProbe(reason: string): Promise<void> {
+  const startedAt = Date.now()
+  const url = await resolveProbeUrl()
+  const names = await collectProbeTargets()
+
+  if (names.length === 0) {
+    probeLogger.warn('No probeable proxies found, skipping')
+    return
+  }
+
+  let alive = 0
+  await runWithWindow(names, DELAY_PROBE_FULL_CONCURRENCY, async (name) => {
+    const record = await probeOne(name, url, false)
+    if (record.delay > 0) alive += 1
+  })
+
+  // 只在这里 prune：这是唯一拿到完整节点集合的时机，用局部名单剪表会破坏覆盖
+  const removed = pruneDelayRecords(new Set(names))
+
+  const now = Date.now()
+  state.lastProbeAt = now
+  state.lastFullProbeAt = now
+  state.lastProbedCount = names.length
+  state.lastAliveCount = alive
+
+  probeLogger.info(
+    `baseline probe done (${reason}): ${alive}/${names.length} alive in ${now - startedAt}ms, ` +
+      `timeout ${DELAY_PROBE_TIMEOUT}ms, url ${url}` +
+      (removed > 0 ? `, pruned ${removed} stale records` : '')
+  )
+}
+
+/** 串行化基线：已有一轮在跑时直接复用，不叠加 */
+function runProbeExclusive(reason: string): Promise<void> {
+  if (inflightProbe) return inflightProbe
+  inflightProbe = runFullProbe(reason)
+    .catch((e) => {
+      probeLogger.warn(`Failed to run baseline delay probe (${reason})`, e)
+    })
+    .finally(() => {
+      inflightProbe = null
+    })
+  return inflightProbe
+}
+
+/** 同步等一轮基线跑完。供 `GET /groups?wait=1` 与 `POST /probe`（不带 proxies）使用 */
+export async function probeAllProxies(reason: string = 'manual'): Promise<IDelayProbeSnapshot> {
+  await runProbeExclusive(reason)
+  return getDelayProbeSnapshot()
+}
+
+/**
+ * 事件触发一轮基线，不等结果。供订阅更新完成 / 配置切换完成调用。
  *
- * 1. **不走单飞锁**。走锁的话脚本指定测 A/B/C，却可能 join 上一轮正在跑的全量，
- *    等二十几秒拿回来的数据跟它要的名单毫无关系。这里用独立的并发闸门代替。
- * 2. **不更新 state 里的任何字段**。lastProbeAt 代表「全局数据新鲜度」，
- *    被 applyFreshness() 用来决定要不要跑现测；局部测几个节点不能代表全局变新，
- *    刷了它会让带 maxDelay 的请求跳过真正需要的现测、悄悄返回陈旧名单。
- *    lastProbedCount / lastAliveCount 同理，它们描述的是最近一轮全量或现测的覆盖面，
- *    脚本靠它区分「确实都不可用」和「还没测过」。
- * 3. **结果照样写进内核 history**，所以候选池判定和「能用」判定都能吃到。
- *    这是好事，但也意味着高频调用会把 history 的 10 条挤满 —— 与 maxAge 下限
- *    撞的是同一个物理天花板。
+ * 事件密集时不会叠加：单飞锁会让后来的直接复用在跑的那一轮。
+ */
+export function triggerBaselineProbe(reason: string): void {
+  void runProbeExclusive(reason)
+}
+
+/** 名单探测里单个节点的结果 */
+export interface INamedProbeItem {
+  name: string
+  /** 上报延迟；0 一律表示失败，原因看 err */
+  delay: number
+  /** 失败原因；测通为 null */
+  err: ProbeErrCode | null
+  /** 这条数据的年龄（毫秒）。0 表示本次现测 */
+  ageMs: number
+  /** 测通且不慢于 maxDelay。maxDelay 没传时等价于 delay > 0 */
+  usable: boolean
+}
+
+/** 名单探测的结果。计数字段的用途是让脚本知道自己传的名单被怎么处理了 */
+export interface INamedProbeResult {
+  /** 逐节点结果，顺序与传入名单一致（去重后） */
+  results: INamedProbeItem[]
+  /** 内核里查不到的名字。订阅更新后失效的旧名字通常落在这里 */
+  unknown: string[]
+  /** 拒测的名字：策略组，或 DIRECT/REJECT 这类内置出口 */
+  rejected: string[]
+  /** 传进来多少个（含重复与非法项） */
+  received: number
+  /** 去重后剩多少个 */
+  deduped: number
+  /** 校验通过、真正参与的有多少个 */
+  accepted: number
+  /** 因为超过名单上限被截掉多少个 */
+  truncated: number
+  /** 其中多少个直接命中了足够新的记录（没有现测） */
+  freshCount: number
+  /** 其中多少个做了现测 */
+  probedCount: number
+  /** 测出可用（延迟大于 0）的数量 */
+  aliveCount: number
+  /** 测通但被 maxDelay 判为太慢的数量 */
+  filteredCount: number
+  /** 本次实际生效的测速超时（恒为 DELAY_PROBE_TIMEOUT，回给脚本便于自查） */
+  timeout: number
+  /** 本次实际使用的测速地址 */
+  url: string
+  /** 本次生效的新鲜度门槛（毫秒），0 表示强制现测 */
+  maxAgeMs: number
+  /** 本次生效的过滤阈值（毫秒），0 表示不过滤 */
+  maxDelay: number
+  elapsedMs: number
+}
+
+/** maxDelay 只用于过滤。非法或 ≤0 都当"不过滤"，绝不允许它影响测量参数 */
+function resolveMaxDelay(input: unknown): number {
+  if (typeof input !== 'number' || !Number.isFinite(input)) return 0
+  if (input <= 0) return 0
+  return Math.floor(input)
+}
+
+/**
+ * 按脚本给定的名单查延迟：命中足够新的记录就直接返回，否则**阻塞现测**一次再返回。
+ *
+ * 关键决策（不要"顺手优化"回去）：
+ *
+ * 1. **不返回旧值**。超龄记录一律重测后再返回。脚本要的是"这一刻能用"，
+ *    给它一条 20 分钟前的数据然后标个 ageMs，等于把判断责任推回脚本。
+ * 2. **不保证返回时间**。耗时严格等于「波数 × timeout」，没有中间档
+ *    （实测 1 波 6.3s / 2 波 12.6s / 3 波 17.7s）。想要 2 秒 SLA 只能靠
+ *    "返回旧值或返回不确定"，而那两条都被否掉了。稳态下大部分名字命中缓存，实际很快。
+ * 3. **不走基线的单飞锁**。走锁的话脚本指定测 A/B/C，却可能 join 上一轮正在跑的
+ *    全量，等二十几秒拿回来的数据跟它要的名单毫无关系。这里用信号量代替。
+ * 4. **不更新 state 里的任何字段**。lastProbeAt 代表"基线覆盖面的新鲜度"，
+ *    局部测几个节点不能代表全组数据变新；刷了它会让 GET /groups 的陈旧提示失真。
  */
 export async function probeNamedProxies(
   names: unknown,
-  timeoutInput?: number
+  options: { maxDelay?: unknown; maxAge?: unknown; probeUrl?: unknown } = {}
 ): Promise<INamedProbeResult> {
   const startedAt = Date.now()
   const raw = Array.isArray(names) ? names : []
 
-  const timeout =
-    typeof timeoutInput === 'number' && Number.isFinite(timeoutInput)
-      ? Math.min(
-          SCRIPT_API_NAMED_PROBE_MAX_TIMEOUT,
-          Math.max(SCRIPT_API_NAMED_PROBE_MIN_TIMEOUT, Math.floor(timeoutInput))
-        )
-      : DELAY_PROBE_QUICK_TIMEOUT
+  const maxAgeMs = resolveProbeMaxAgeMs(options.maxAge)
+  const maxDelay = resolveMaxDelay(options.maxDelay)
+  const url = await resolveProbeUrl(options.probeUrl)
 
   // 去重保留首次出现顺序：重复名不该占掉名单额度
   const seen = new Set<string>()
@@ -437,15 +466,7 @@ export async function probeNamedProxies(
       unknown.push(name)
       continue
     }
-    // 与 collectProbeTargets() 同一口径：测组等于测它当前选中的节点，结果归属不清
-    if ('all' in proxy) {
-      rejected.push(name)
-      continue
-    }
-    if (
-      SKIP_PROXY_NAMES.has(name) ||
-      SKIP_PROXY_TYPES.has(String(proxy.type ?? '').toLowerCase())
-    ) {
+    if (!isProbeableProxy(name, proxy)) {
       rejected.push(name)
       continue
     }
@@ -454,16 +475,55 @@ export async function probeNamedProxies(
 
   // 截断放在去重与校验之后：重复名、不存在的名、策略组名都不该占额度
   const targets = valid.slice(0, SCRIPT_API_NAMED_PROBE_MAX_NAMES)
-  const delays = await Promise.all(targets.map((name) => probeOneNamed(name, timeout)))
 
-  const results = targets.map((name, index) => ({ name, delay: delays[index] }))
-  const aliveCount = delays.filter((delay) => delay > 0).length
+  // 命中判定要连 url 一起比：换了测速地址的旧记录不是同一口径的数据
+  const hits = new Map<string, IProbeDelayRecord>()
+  const toProbe: string[] = []
+  for (const name of targets) {
+    const record = maxAgeMs > 0 ? getFreshDelayRecord(name, maxAgeMs, startedAt) : undefined
+    if (record && record.url === url) hits.set(name, record)
+    else toProbe.push(name)
+  }
+
+  await Promise.all(toProbe.map((name) => probeOne(name, url, true)))
+
+  const now = Date.now()
+  const results: INamedProbeItem[] = targets.map((name) => {
+    const record = hits.get(name)
+    if (record) {
+      return {
+        name,
+        delay: record.delay,
+        err: record.err,
+        ageMs: Math.max(0, now - record.at),
+        usable: record.delay > 0 && (maxDelay === 0 || record.delay <= maxDelay)
+      }
+    }
+    // 现测路径：probeOne 一定写过表，读不到只可能是并发 prune（基线刚跑完）擦掉了
+    const fresh = getFreshDelayRecord(name, Number.MAX_SAFE_INTEGER, now)
+    const ageMs = getRecordAgeMs(name, now) ?? 0
+    const delay = fresh?.delay ?? 0
+    return {
+      name,
+      delay,
+      // ⚠ 不能写成 `fresh?.err ?? 'kernel_error'`：测通的记录 err 就是 null，
+      // ?? 对 null 也会兜底，于是每一个成功的现测都会被标成 kernel_error。
+      // 这里要区分的是「表里没这条记录」和「记录里 err 是 null」。
+      err: fresh ? fresh.err : 'kernel_error',
+      ageMs,
+      usable: delay > 0 && (maxDelay === 0 || delay <= maxDelay)
+    }
+  })
+
+  const aliveCount = results.filter((item) => item.delay > 0).length
+  const filteredCount = results.filter((item) => item.delay > 0 && !item.usable).length
   const elapsedMs = Date.now() - startedAt
 
   probeLogger.info(
     `named probe done: ${aliveCount}/${targets.length} alive in ${elapsedMs}ms ` +
-      `(received ${raw.length}, unknown ${unknown.length}, rejected ${rejected.length}, ` +
-      `truncated ${valid.length - targets.length}, timeout ${timeout}ms)`
+      `(fresh ${hits.size}, probed ${toProbe.length}, filtered ${filteredCount}, ` +
+      `received ${raw.length}, unknown ${unknown.length}, rejected ${rejected.length}, ` +
+      `truncated ${valid.length - targets.length}, maxAge ${maxAgeMs}ms, maxDelay ${maxDelay})`
   )
 
   return {
@@ -474,8 +534,14 @@ export async function probeNamedProxies(
     deduped: deduped.length,
     accepted: targets.length,
     truncated: valid.length - targets.length,
+    freshCount: hits.size,
+    probedCount: toProbe.length,
     aliveCount,
-    timeout,
+    filteredCount,
+    timeout: DELAY_PROBE_TIMEOUT,
+    url,
+    maxAgeMs,
+    maxDelay,
     elapsedMs
   }
 }
@@ -484,17 +550,23 @@ export async function initDelayProbe(): Promise<void> {
   stopDelayProbe()
 
   // 启动后先等一会儿再跑第一轮：内核刚起来时还在建连接、拉 geo 数据，
-  // 这时候打 159 个测速请求既慢又不准。
+  // 这时候打几百个测速请求既慢又不准。
+  //
+  // 这一轮不是可选项：probeStore 不落盘，冷启动时表是空的，
+  // 而 isUsable() 读表 —— 没有这一轮，脚本会拿到空名单。
   startupTimer = setTimeout(() => {
     startupTimer = null
-    void runProbeExclusive('full')
+    void runProbeExclusive('startup')
   }, DELAY_PROBE_STARTUP_DELAY_MS)
 
   try {
-    fullProbeCron = new Cron(`0 */${DELAY_PROBE_FULL_INTERVAL_MINUTES} * * * *`, () => {
-      void runProbeExclusive('full')
+    // 3 小时一轮。基线只负责覆盖，新鲜度由 lazy refresh 负责，
+    // 所以这里的周期是按流量账定的（642 个节点 × 8.01 KB × 8 轮/天 ≈ 1.2 GB/月）。
+    const hours = Math.max(1, Math.round(DELAY_PROBE_FULL_INTERVAL_MINUTES / 60))
+    fullProbeCron = new Cron(`0 0 */${hours} * * *`, () => {
+      void runProbeExclusive('cron')
     })
-    probeLogger.info(`Delay probe scheduled every ${DELAY_PROBE_FULL_INTERVAL_MINUTES} minutes`)
+    probeLogger.info(`Delay probe scheduled every ${hours} hour(s)`)
   } catch (e) {
     probeLogger.warn('Failed to schedule delay probe cron', e)
   }

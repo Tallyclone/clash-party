@@ -11,19 +11,19 @@ import {
 import { expandScriptOutlets } from '../../shared/scriptOutlet'
 import { getAppConfig } from '../config'
 import {
-  ensureFreshDelays,
   getDelayDataAgeMs,
   getDelayProbeSnapshot,
   probeAllProxies,
-  probeCandidateProxies,
   probeNamedProxies
 } from '../core/delayProbe'
+import { probeIpByStations } from '../core/probeStation'
+import { getDelayRecord, getProbeStoreStats, isRecordUsable } from '../core/probeStore'
 import {
   mihomoChangeProxy,
   mihomoCloseAllConnections,
   mihomoGroups,
   mihomoHotReloadConfig,
-  mihomoProxies,
+  mihomoProxyDetail,
   mihomoUnfixedProxy
 } from '../core/mihomoApi'
 import {
@@ -68,9 +68,15 @@ function sendError(res: express.Response, status: number, message: string): void
 interface IDelayFilterOptions {
   /** 保留延迟在 (0, maxDelay] 之内的节点 */
   maxDelay: number
-  /** 数据超过这个年龄就先探测一次 */
-  maxAgeMs: number
-  /** true：等探测完再返回（约 1~2 秒）；false：立刻返回手上的数据，后台顺便刷一轮 */
+  /**
+   * 数据超过这个年龄就在 meta 里标记为陈旧。
+   *
+   * ⚠ 这里只是**提示**，不再触发探测。旧行为是「数据旧就顺手 quick 一轮」，
+   * 那条路依赖候选池（已删除），而且会让一个只是想读名单的请求突然等十几秒。
+   * 想要现测请显式带 `wait=1`（全量基线），或用 `POST /probe` 只测点名的节点。
+   */
+  staleAfterMs: number
+  /** true：先同步跑一轮全量基线再返回 */
   wait: boolean
 }
 
@@ -107,64 +113,83 @@ async function resolveDelayFilter(
   const maxAgeSec = parsePositiveInt(query.maxAge)
   return {
     maxDelay,
-    // 下限不能省：maxAge 极小时几乎每个请求都判定过期，现测会被背靠背连续触发，
-    // 而且候选池回看的内核 history 只有 10 条，轮询过密时容忍机制会被直接烧穿
-    maxAgeMs:
+    staleAfterMs:
       maxAgeSec === null
         ? DELAY_PROBE_FRESH_MS
         : Math.max(SCRIPT_API_MIN_MAX_AGE_MS, maxAgeSec * 1000),
-    wait: parseBoolean(query.wait, true)
+    // 默认不等：读名单是高频操作，让它顺带触发全量探测会把「查一下」变成「等十几秒」
+    wait: parseBoolean(query.wait, false)
   }
 }
 
-/** 按需保证数据新鲜。返回本次是否真的等待了一轮探测 */
-async function applyFreshness(options: IDelayFilterOptions): Promise<boolean> {
-  const age = getDelayDataAgeMs()
-  if (age !== null && age <= options.maxAgeMs) return false
-  if (options.wait) return await ensureFreshDelays(options.maxAgeMs)
-  // 不等：先把手上的数据给出去，后台悄悄测一轮，脚本下次来就是新的
-  void ensureFreshDelays(options.maxAgeMs).catch(() => {})
-  return false
+/**
+ * `wait=1` 时同步跑一轮全量基线。返回本次是否真的等了。
+ *
+ * **刻意不受 maxAge 刹车**：脚本带 wait=1 就是明确要求「现在测一遍」，
+ * 用「数据还算新」把它挡回去会让脚本没有任何办法强制刷新。
+ * 防滥用靠探测模块的单飞锁：并发的 wait=1 会 join 同一轮，不会叠加压力。
+ */
+async function applyWait(options: IDelayFilterOptions): Promise<boolean> {
+  if (!options.wait) return false
+  await probeAllProxies('groups-wait')
+  return true
 }
 
-/** 取节点最近一次的延迟记录。没测过返回 null，测出连不上则 delay 为 0 */
-function lastDelayOf(
-  proxy: IMihomoProxy | IMihomoGroup | undefined
-): { delay: number; time: string } | null {
-  const history = proxy?.history
-  if (!Array.isArray(history) || history.length === 0) return null
-  const last = history[history.length - 1]
-  if (!last || typeof last.delay !== 'number') return null
-  return { delay: last.delay, time: last.time }
+/**
+ * 「能用」判定：只认 probeStore 里的记录。
+ *
+ * 为什么不读内核 history（这是本次改造的核心修正之一）：history 的最后一条里
+ * delay=0 同时表示「测了不通」「压根没测过」「被 timeout 截断但节点其实健康」，
+ * 而 504 还会往 history 写一条顶到 timeout 的正数假延迟。四种情况在那条路上
+ * 无法区分，实测导致真实可出网的节点里 82.5% 被判成不可用。详见 probeStore.ts。
+ *
+ * 策略组自然被排除：基线只测具体节点，组名不会出现在表里。
+ */
+function isUsableName(name: string, maxDelay: number): boolean {
+  return isRecordUsable(getDelayRecord(name), maxDelay)
 }
 
-function isUsable(proxy: IMihomoProxy | IMihomoGroup | undefined, maxDelay: number): boolean {
-  // 策略组不参与：组的延迟归属不清，脚本要的是能直接指定的具体节点
-  if (!proxy || 'all' in proxy) return false
-  const last = lastDelayOf(proxy)
-  // 没测过的一律不给 —— 脚本要的是「保证能用」，没数据不算能用
-  if (last === null) return false
-  return last.delay > 0 && last.delay <= maxDelay
+/** 取一个节点在表里的明细，给 `/groups/:group` 排序用 */
+function delayDetailOf(
+  name: string,
+  maxDelay: number,
+  now: number
+): { name: string; delay: number; time: string; ageMs: number } | null {
+  const record = getDelayRecord(name)
+  if (!isRecordUsable(record, maxDelay) || !record) return null
+  return {
+    name,
+    delay: record.delay,
+    time: new Date(record.at).toISOString(),
+    ageMs: Math.max(0, now - record.at)
+  }
 }
 
 /** 过滤结果的元信息，让脚本自己判断这批名单值不值得信 */
 function buildFilterMeta(options: IDelayFilterOptions, probed: boolean): Record<string, unknown> {
   const snapshot = getDelayProbeSnapshot()
+  const store = getProbeStoreStats()
+  const dataAgeMs = getDelayDataAgeMs()
   return {
     maxDelay: options.maxDelay,
-    maxAgeSec: Math.round(options.maxAgeMs / 1000),
-    // 本次请求是否等待了一轮现测
+    maxAgeSec: Math.round(options.staleAfterMs / 1000),
+    // 本次请求是否等待了一轮基线
     probed,
     // 数据年龄（毫秒），从未探测过为 null
-    dataAgeMs: getDelayDataAgeMs(),
+    dataAgeMs,
+    // 超过 maxAge 只是提示，不会自动触发探测；要新数据请带 wait=1 或用 POST /probe
+    stale: dataAgeMs === null || dataAgeMs > options.staleAfterMs,
     lastProbeAt: snapshot.lastProbeAt ? new Date(snapshot.lastProbeAt).toISOString() : null,
     lastFullProbeAt: snapshot.lastFullProbeAt
       ? new Date(snapshot.lastFullProbeAt).toISOString()
       : null,
-    // 最近一次探测覆盖 / 测活的节点数，用于区分「确实都不可用」和「还没测过」
+    // 最近一轮基线覆盖 / 测活的节点数，用于区分「确实都不可用」和「还没测过」
     lastProbedCount: snapshot.lastProbedCount,
     lastAliveCount: snapshot.lastAliveCount,
-    probing: snapshot.probing
+    probing: snapshot.probing,
+    // 表里有多少条记录、其中多少条测得通。表为空说明启动基线还没跑完
+    storeSize: store.size,
+    storeAlive: store.alive
   }
 }
 
@@ -195,7 +220,7 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
   app.get('/groups', async (req, res) => {
     try {
       const filter = await resolveDelayFilter(req.query as Record<string, unknown>)
-      const probed = filter ? await applyFreshness(filter) : false
+      const probed = filter ? await applyWait(filter) : false
       const groups = await mihomoGroups()
 
       res.json({
@@ -210,7 +235,7 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
           if (!filter) {
             return { ...base, proxies: group.all.map((proxy) => proxy.name) }
           }
-          const usable = group.all.filter((proxy) => isUsable(proxy, filter.maxDelay))
+          const usable = group.all.filter((proxy) => isUsableName(proxy.name, filter.maxDelay))
           return {
             ...base,
             proxies: usable.map((proxy) => proxy.name),
@@ -230,9 +255,15 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
   app.get('/groups/:group', async (req, res) => {
     try {
       const filter = await resolveDelayFilter(req.query as Record<string, unknown>)
-      const probed = filter ? await applyFreshness(filter) : false
-      const proxies = await mihomoProxies()
-      const target = proxies.proxies[req.params.group]
+      const probed = filter ? await applyWait(filter) : false
+      // 只需要这一个组，走单组查询：全量 /proxies 在大配置下是 5MB / parse 数十毫秒的
+      // 主进程同步开销，而这里从来只用到 target 一个对象。
+      const detail = await mihomoProxyDetail(req.params.group)
+      if (detail.error) {
+        sendError(res, 500, detail.error)
+        return
+      }
+      const target = detail.proxy
       if (!target || !('all' in target)) {
         sendError(res, 404, `group not found: ${req.params.group}`)
         return
@@ -251,14 +282,13 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
         return
       }
 
+      const now = Date.now()
       const details = target.all
-        .map((name) => {
-          const member = proxies.proxies[name]
-          if (!isUsable(member, filter.maxDelay)) return null
-          const last = lastDelayOf(member)
-          return last ? { name, delay: last.delay, time: last.time } : null
-        })
-        .filter((item): item is { name: string; delay: number; time: string } => item !== null)
+        .map((name) => delayDetailOf(name, filter.maxDelay, now))
+        .filter(
+          (item): item is { name: string; delay: number; time: string; ageMs: number } =>
+            item !== null
+        )
         .sort((a, b) => a.delay - b.delay)
 
       res.json({
@@ -290,8 +320,14 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
     }
 
     try {
-      const proxies = await mihomoProxies()
-      const group = proxies.proxies[groupName]
+      // 同样走单组查询，避免为了一次切换付全量 /proxies 的解析开销。
+      // 单组响应的 all[] 已核实与全量里的同名对象逐项一致（含顺序），成员校验语义不变。
+      const detail = await mihomoProxyDetail(groupName)
+      if (detail.error) {
+        sendError(res, 500, detail.error)
+        return
+      }
+      const group = detail.proxy
       if (!group || !('all' in group)) {
         sendError(res, 404, `group not found: ${groupName}`)
         return
@@ -339,27 +375,74 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
   })
 
   /**
-   * 主动触发一轮延迟探测。三种范围，按参数分派：
+   * 探测入口。三种用法：
    *
-   * - 不带参数：只测候选池（最近几次成绩里还有能看的那批），约 1 秒级返回。
-   * - `?full=1`：测全部节点，慢得多（几百个节点要二十几秒），一般只在刚启动或长时间没测时用。
-   * - body 里带 `proxies` 数组：只测这批指定节点，并**逐节点**返回延迟。
+   * - body 带 `proxies` + `mode:"delay"`（默认）：查这批节点的延迟。命中 probeStore 里
+   *   足够新的记录（默认 300 秒，可用 `maxAge` 调，0 = 强制现测）就直接返回，
+   *   否则**现测一次**再返回。不返回旧值。
+   * - body 带 `proxies` + `mode:"ip"`：占用探测工位实拨，返回真实出口 IP。
+   *   这是内核测速做不到的事（内核只给延迟），所以只有这个模式需要工位。
+   * - 不带 `proxies`：跑一轮全量基线（保全组覆盖），返回统计。
    *
    * 名单走 body 而不是 query 是必须的：节点名普遍含 emoji、方括号和空格，
    * 塞进 query 要逐个 encodeURIComponent，而且 URL 长度撑不住几百个名字。
    *
-   * 名单探测与前两种不共享闸门，也不刷新全局数据新鲜度（细节见 probeNamedProxies 的注释），
-   * 所以响应里额外回一个 dataAgeMs 让脚本自己知道全局数据有多旧。
+   * ⚠ 耗时不做承诺。内核测速的耗时严格等于「波数 × 6000ms」，只有离散档位
+   * （实测 1 波 6.3s / 2 波 12.6s / 3 波 17.7s），堆并发只会把健康节点打成 delay 0。
+   * 稳态下大部分名字命中缓存，实际很快。
+   *
+   * ⚠ 旧的 `body.timeout` 参数已废弃并被忽略：测速 timeout 现在固定 6000ms，
+   * 脚本只需要给 `maxDelay`（只用于过滤结果）。详见 appConfig 的 DELAY_PROBE_TIMEOUT。
    */
   app.post('/probe', async (req, res) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>
+      const mode = typeof body.mode === 'string' ? body.mode.trim().toLowerCase() : 'delay'
+
       if (Array.isArray(body.proxies)) {
-        const timeout = typeof body.timeout === 'number' ? body.timeout : undefined
-        const probe = await probeNamedProxies(body.proxies, timeout)
+        if (mode === 'ip') {
+          const probe = await probeIpByStations(body.proxies)
+          res.json({
+            ok: true,
+            mode: 'ip',
+            stations: probe.stations,
+            targets: probe.targets,
+            targetTimeout: probe.targetTimeout,
+            elapsedMs: probe.elapsedMs,
+            limits: {
+              received: probe.received,
+              deduped: probe.deduped,
+              accepted: probe.accepted,
+              truncated: probe.truncated,
+              limit: probe.limit
+            },
+            counts: { ok: probe.okCount, failed: probe.accepted - probe.okCount },
+            results: probe.results,
+            unknown: probe.unknown,
+            rejected: probe.rejected
+          })
+          return
+        }
+
+        if (mode !== 'delay') {
+          sendError(res, 400, `unknown mode: ${mode} (expected "delay" or "ip")`)
+          return
+        }
+
+        const probe = await probeNamedProxies(body.proxies, {
+          maxDelay: body.maxDelay,
+          maxAge: body.maxAge,
+          probeUrl: body.probeUrl
+        })
         res.json({
           ok: true,
+          mode: 'delay',
           scope: 'named',
+          timeout: probe.timeout,
+          url: probe.url,
+          maxAgeSec: Math.round(probe.maxAgeMs / 1000),
+          maxDelay: probe.maxDelay,
+          elapsedMs: probe.elapsedMs,
           limits: {
             received: probe.received,
             deduped: probe.deduped,
@@ -367,26 +450,36 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
             truncated: probe.truncated,
             limit: SCRIPT_API_NAMED_PROBE_MAX_NAMES
           },
-          timeout: probe.timeout,
-          elapsedMs: probe.elapsedMs,
+          counts: {
+            fresh: probe.freshCount,
+            probed: probe.probedCount,
+            alive: probe.aliveCount,
+            filtered: probe.filteredCount
+          },
+          // 兼容旧字段名，脚本迁移期两套都能读
           probedCount: probe.accepted,
           aliveCount: probe.aliveCount,
           results: probe.results,
           unknown: probe.unknown,
           rejected: probe.rejected,
-          // 名单探测刻意不刷新这个时钟，所以它反映的是最近一轮全量/现测的年龄
-          dataAgeMs: getDelayDataAgeMs()
+          // 名单探测刻意不刷新这个时钟，所以它反映的是最近一轮全量基线的年龄
+          dataAgeMs: getDelayDataAgeMs(),
+          ...(body.timeout !== undefined ? { timeoutIgnored: true } : {})
         })
         return
       }
 
-      const full = parseBoolean((req.query as Record<string, unknown>).full, false)
-      const snapshot = full ? await probeAllProxies() : await probeCandidateProxies()
+      // 不带名单 = 跑一轮全量基线。`?full=1` 保留但已无意义：quick 档不存在了
+      const snapshot = await probeAllProxies('script-api')
+      const store = getProbeStoreStats()
       res.json({
         ok: true,
-        scope: full ? 'full' : 'quick',
+        mode: 'delay',
+        scope: 'full',
         probedCount: snapshot.lastProbedCount,
         aliveCount: snapshot.lastAliveCount,
+        storeSize: store.size,
+        storeAlive: store.alive,
         lastProbeAt: snapshot.lastProbeAt ? new Date(snapshot.lastProbeAt).toISOString() : null,
         lastFullProbeAt: snapshot.lastFullProbeAt
           ? new Date(snapshot.lastFullProbeAt).toISOString()
