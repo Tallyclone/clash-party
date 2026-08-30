@@ -1,0 +1,18 @@
+{
+  "$comment": [
+    "cf-shield-probe.mjs 的参数配置文件。优先级：命令行 > 本文件 > 脚本内置默认。",
+    "候选路径按顺序探测：<仓库根>/cf-shield.config.json、<仓库根>/scripts/cf-shield.config.json。",
+    "也可以用 --settings <path> 显式指定（指定了却不存在会直接 exit 1）。",
+    "键名用 camelCase，对应 CLI 的 --kebab-case（如 minApply ↔ --min-apply）。",
+    "注意：不要把 scriptApi 的 token 写进来，脚本从 Clash Party 的 config.yaml 自己读。",
+    "注意：别和 pm2 的 ecosystem.cf-shield.config.cjs 搞混，那个是调度配置，这个是探测参数。",
+    "故意不写 apply：手动试跑时忘了它是 true 会直接改线上覆写并重载内核，所以只让 pm2 的 args 带 --apply。"
+  ],
+  "targets": ["https://nowsecure.nl/", "https://discord.com/"],
+  "require": "all",
+  "timeout": 12000,
+  "retry": 2,
+  "minApply": 3,
+  "dedupeIp": true,
+  "outletPrefix": ""
+}

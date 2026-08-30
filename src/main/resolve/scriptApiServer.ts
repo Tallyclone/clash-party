@@ -22,6 +22,7 @@ import {
   mihomoChangeProxy,
   mihomoCloseAllConnections,
   mihomoGroups,
+  mihomoHotReloadConfig,
   mihomoProxies,
   mihomoUnfixedProxy
 } from '../core/mihomoApi'
@@ -305,8 +306,15 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
 
       await mihomoChangeProxy(groupName, proxyName)
 
-      // listener 的连接可能仍复用旧节点，按配置断开让新节点立刻生效
-      if (config.autoCloseConnection) {
+      // listener 的连接可能仍复用旧节点，按配置断开让新节点立刻生效。
+      // `?close=0` 可以单次抑制：批量探测要连着切几百次，每次都断全局连接
+      // 会把用户正在跑的浏览器/下载反复掐断，而探测本身走的是独立出口端口，
+      // 新建连接自然就用新节点，不需要清场。
+      const shouldClose = parseBoolean(
+        (req.query as Record<string, unknown>).close,
+        config.autoCloseConnection
+      )
+      if (shouldClose) {
         await mihomoCloseAllConnections()
       }
 
@@ -384,6 +392,30 @@ function buildApp(config: INormalizedScriptApiConfig): express.Express {
           ? new Date(snapshot.lastFullProbeAt).toISOString()
           : null
       })
+    } catch (e) {
+      sendError(res, 500, `${e}`)
+    }
+  })
+
+  /**
+   * 重新生成配置并热重载内核。
+   *
+   * 为什么需要这个端点：改策略组的**成员名单**（不是选中项）属于配置文件内容，
+   * mihomo 的 PATCH /configs 不接受 proxy-groups，只能重写 work/config.yaml 再
+   * `PUT /configs?force=true`。而覆写文件（override/*.js）没有 watcher，脚本改完
+   * 若没人触发 generateProfile，改动要等到用户下次在 UI 里动配置才生效。
+   *
+   * mihomoHotReloadConfig() 内部已经包含 generateProfile()，所以覆写脚本里写的
+   * 新名单会在这一步被重新执行、写进 work config，再交给内核整图重建。
+   * 内核没在跑时它会自动退化成 restartCore()。
+   *
+   * 副作用：adapter 整图重建，进行中的连接会中断，别在循环里调用。
+   */
+  app.post('/reload', async (_req, res) => {
+    try {
+      await mihomoHotReloadConfig()
+      scriptApiLogger.info('Script API triggered config hot reload')
+      res.json({ ok: true, reloaded: true })
     } catch (e) {
       sendError(res, 500, `${e}`)
     }
