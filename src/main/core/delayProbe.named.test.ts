@@ -30,11 +30,8 @@ vi.mock('./mihomoApi', () => ({
   mihomoProbeDelay: vi.fn()
 }))
 
-const {
-  DELAY_PROBE_TIMEOUT,
-  SCRIPT_API_NAMED_PROBE_CONCURRENCY,
-  SCRIPT_API_NAMED_PROBE_MAX_NAMES
-} = await import('../../shared/appConfig')
+const { DELAY_PROBE_TIMEOUT, PROBE_GATE_CONCURRENCY, SCRIPT_API_NAMED_PROBE_MAX_NAMES } =
+  await import('../../shared/appConfig')
 const { DEFAULT_PROBE_URL, getDelayDataAgeMs, getDelayProbeSnapshot, probeNamedProxies } =
   await import('./delayProbe')
 const { mihomoProbeDelay, mihomoProxies } = await import('./mihomoApi')
@@ -341,7 +338,7 @@ describe('probeNamedProxies 结果口径', () => {
 
 describe('probeNamedProxies 并发闸门', () => {
   it('在飞的测速请求数不超过上限', async () => {
-    const total = SCRIPT_API_NAMED_PROBE_CONCURRENCY + 60
+    const total = PROBE_GATE_CONCURRENCY + 60
     const names = Array.from({ length: total }, (_, i) => `N${i}`)
     const entries: Record<string, unknown> = {}
     for (const name of names) entries[name] = proxy(name)
@@ -360,12 +357,12 @@ describe('probeNamedProxies 并发闸门', () => {
     const result = await probeNamedProxies(names, { maxAge: 0 })
 
     expect(result.accepted).toBe(Math.min(total, SCRIPT_API_NAMED_PROBE_MAX_NAMES))
-    expect(peak).toBe(SCRIPT_API_NAMED_PROBE_CONCURRENCY)
+    expect(peak).toBe(PROBE_GATE_CONCURRENCY)
     expect(inflight).toBe(0)
   })
 
   it('两个请求共享同一个闸门，总在飞数仍不超上限', async () => {
-    const half = SCRIPT_API_NAMED_PROBE_CONCURRENCY
+    const half = PROBE_GATE_CONCURRENCY
     const names = Array.from({ length: half * 2 }, (_, i) => `N${i}`)
     const entries: Record<string, unknown> = {}
     for (const name of names) entries[name] = proxy(name)
@@ -386,12 +383,12 @@ describe('probeNamedProxies 并发闸门', () => {
       probeNamedProxies(names.slice(half), { maxAge: 0 })
     ])
 
-    expect(peak).toBe(SCRIPT_API_NAMED_PROBE_CONCURRENCY)
+    expect(peak).toBe(PROBE_GATE_CONCURRENCY)
     expect(inflight).toBe(0)
   })
 
   it('测速全部抛错时名额照样归还，不会把闸门卡死', async () => {
-    const names = Array.from({ length: SCRIPT_API_NAMED_PROBE_CONCURRENCY + 5 }, (_, i) => `E${i}`)
+    const names = Array.from({ length: PROBE_GATE_CONCURRENCY + 5 }, (_, i) => `E${i}`)
     const entries: Record<string, unknown> = {}
     for (const name of names) entries[name] = proxy(name)
     setProxies(entries)

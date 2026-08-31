@@ -124,6 +124,8 @@ const validInvokeChannels = [
   'scriptApiPort',
   'scriptApiRunning',
   'createScriptApiToken',
+  // Delay probe
+  'restartDelayProbe',
   // Theme
   'resolveThemes',
   'fetchThemes',

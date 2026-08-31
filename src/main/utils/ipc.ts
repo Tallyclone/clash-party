@@ -71,6 +71,7 @@ import {
   restartScriptApiServer,
   stopScriptApiServer
 } from '../resolve/scriptApiServer'
+import { restartDelayProbe } from '../core/delayProbe'
 import {
   quitWithoutCore,
   restartCore,
@@ -346,6 +347,8 @@ const asyncHandlers: Record<string, AsyncFn> = {
   // Script API
   restartScriptApiServer,
   stopScriptApiServer,
+  // Delay probe
+  restartDelayProbe,
   // Theme
   resolveThemes,
   fetchThemes,

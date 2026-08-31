@@ -17,6 +17,7 @@ import {
   DEFAULT_SCRIPT_OUTLETS,
   DEFAULT_SIDER_ORDER,
   DEFAULT_USE_SUB_STORE,
+  DELAY_PROBE_FULL_INTERVAL_MINUTES,
   getDefaultMihomoTunDevice,
   DEFAULT_USE_NAMESERVER_POLICY
 } from '../../shared/appConfig'
@@ -87,6 +88,7 @@ export const defaultConfig: IAppConfig = {
   hotReloadProfileAutoCloseConnection: false,
   scriptOutlets: DEFAULT_SCRIPT_OUTLETS,
   scriptApi: DEFAULT_SCRIPT_API_CONFIG,
+  delayProbeIntervalMinutes: DELAY_PROBE_FULL_INTERVAL_MINUTES,
   hideSlowProxies: DEFAULT_HIDE_SLOW_PROXIES,
   hideSlowProxiesGroups: DEFAULT_HIDE_SLOW_PROXIES_GROUPS,
   availableDelayThreshold: DEFAULT_AVAILABLE_DELAY_THRESHOLD

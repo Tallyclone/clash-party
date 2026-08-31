@@ -11,6 +11,7 @@ import {
   mihomoGroups,
   mihomoProxies,
   restartCore,
+  restartDelayProbe,
   restartScriptApiServer,
   scriptApiPort,
   scriptApiRunning,
@@ -26,6 +27,8 @@ import {
   DEFAULT_SCRIPT_API_PORT,
   DEFAULT_SCRIPT_OUTLET_INTERVAL,
   DEFAULT_SCRIPT_OUTLET_TEST_URL,
+  DELAY_PROBE_FULL_INTERVAL_MIN_MINUTES,
+  normalizeDelayProbeIntervalMinutes,
   SCRIPT_API_LISTEN_ADDRESS,
   SCRIPT_OUTLET_LISTEN_ADDRESS,
   SCRIPT_OUTLET_MAX_BATCH_COUNT
@@ -274,6 +277,34 @@ const Outlet: React.FC = () => {
     (scriptApi.port ?? 0) > 65535 ||
     usedPorts.has(scriptApi.port ?? 0)
 
+  // ==================== 全量测速间隔 ====================
+
+  // 输入框保存的是「用户正在敲的原文」，不能每次按键都归一化 —— 否则用户想输 30
+  // 时刚敲下 3 就会被夹紧成 5，光标后面的字符再也接不上。归一化只在失焦/保存时做。
+  const [probeIntervalDraft, setProbeIntervalDraft] = useState<string | null>(null)
+  const [probeBusy, setProbeBusy] = useState(false)
+  const probeInterval = normalizeDelayProbeIntervalMinutes(appConfig?.delayProbeIntervalMinutes)
+
+  const applyProbeInterval = async (): Promise<void> => {
+    if (probeIntervalDraft === null) return
+    const raw = probeIntervalDraft.trim()
+    // 清空输入框视为「用默认值」，交给归一化函数处理（undefined → 默认 180）
+    const next = normalizeDelayProbeIntervalMinutes(raw === '' ? undefined : Number(raw))
+    setProbeIntervalDraft(null)
+    if (next === probeInterval) return
+    try {
+      setProbeBusy(true)
+      await patchAppConfig({ delayProbeIntervalMinutes: next })
+      // 配置只落盘不会影响已注册的 setInterval，必须显式重建调度
+      await restartDelayProbe()
+      toast.success(t('outlet.api.probeIntervalApplied'))
+    } catch (e) {
+      toast.detailedError(`${e}`, t('outlet.api.applyFailed'))
+    } finally {
+      setProbeBusy(false)
+    }
+  }
+
   return (
     <BasePage
       title={t('outlet.title')}
@@ -377,6 +408,28 @@ const Outlet: React.FC = () => {
             isSelected={scriptApi.autoCloseConnection !== false}
             onValueChange={(v) => patchScriptApi({ autoCloseConnection: v })}
           />
+        </SettingItem>
+
+        <SettingItem title={t('outlet.api.probeInterval')} divider>
+          <div className="flex items-center gap-2 w-[60%]">
+            <Input
+              size="sm"
+              type="number"
+              min={0}
+              isDisabled={probeBusy}
+              description={t('outlet.api.probeIntervalDesc', {
+                min: DELAY_PROBE_FULL_INTERVAL_MIN_MINUTES
+              })}
+              value={probeIntervalDraft ?? `${probeInterval}`}
+              onValueChange={setProbeIntervalDraft}
+              onBlur={applyProbeInterval}
+            />
+            <Chip size="sm" variant="flat" color={probeInterval > 0 ? 'success' : 'default'}>
+              {probeInterval > 0
+                ? t('outlet.api.probeIntervalOn', { num: probeInterval })
+                : t('outlet.api.probeIntervalOff')}
+            </Chip>
+          </div>
         </SettingItem>
 
         <SettingItem title={t('outlet.api.baseUrl')}>

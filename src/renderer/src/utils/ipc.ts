@@ -33,6 +33,7 @@ interface IpcApi {
   scriptApiPort: () => Promise<number | null>
   scriptApiRunning: () => Promise<boolean>
   createScriptApiToken: () => Promise<string>
+  restartDelayProbe: () => Promise<void>
   mihomoUpgradeGeo: () => Promise<void>
   mihomoUpgrade: () => Promise<void>
   mihomoUpgradeUI: () => Promise<void>
@@ -210,6 +211,7 @@ export const {
   scriptApiPort,
   scriptApiRunning,
   createScriptApiToken,
+  restartDelayProbe,
   mihomoUpgradeGeo,
   mihomoUpgrade,
   mihomoUpgradeUI,

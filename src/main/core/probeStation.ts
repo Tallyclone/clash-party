@@ -12,6 +12,7 @@ import { probeStationGroupName } from '../../shared/scriptOutlet'
 import { createLogger } from '../utils/logger'
 import { isProbeableProxy, triggerBaselineProbe } from './delayProbe'
 import { mihomoChangeProxy, mihomoProxies } from './mihomoApi'
+import { acquireProbeSlots, releaseProbeSlots } from './probeGate'
 import { getProbeStationPorts } from './probeStationRegistry'
 import { ProbeErrCode } from './probeStore'
 
@@ -574,6 +575,19 @@ export async function probeIpByStations(names: unknown): Promise<IProbeIpResult>
 
       const name = targets[index]
       const queueStartedAt = Date.now()
+
+      // ⚠ 顺序不能反：**先领全局闸门名额，再拿工位**。
+      //
+      // 反过来（先占工位再等闸门）会踩两个坑：
+      // 1. 死锁风险 —— 两个 worker 一个持工位等名额、一个持名额等工位，就锁住了。
+      //    统一成「名额 → 工位」后，任何持工位的人都已经拿到名额、必定能往下走。
+      // 2. watchdog 误收 —— 租约超过 PROBE_IP_LEASE_HARD_LIMIT_MS × 2 就会被强制回收。
+      //    闸门在基线满载时的排队时间远超这个值，于是工位会在 worker 眼皮底下被收走
+      //    转给别人，两个 worker 同时切同一个组 —— 正是工位机制要防的「串味」。
+      //    先等闸门就不会让租约里含有排队时间。
+      //
+      // 名额按连接数算：一个节点会同时拨 PROBE_IP_TARGETS 里的每个目标。
+      const slots = await acquireProbeSlots(PROBE_IP_TARGETS.length)
       const lease = await acquireStation()
       let outcome: IDialOutcome | null = null
       let queueMs = Date.now() - queueStartedAt
@@ -592,6 +606,7 @@ export async function probeIpByStations(names: unknown): Promise<IProbeIpResult>
         // 逐个立即归还，不攒到请求结束
         noteStationResult(lease.station, outcome?.err ?? null)
         releaseLease(lease)
+        releaseProbeSlots(slots)
       }
 
       const connectMs = outcome?.connectMs ?? null

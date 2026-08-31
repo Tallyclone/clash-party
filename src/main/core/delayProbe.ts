@@ -1,15 +1,15 @@
-import { Cron } from 'croner'
 import {
   DELAY_PROBE_FULL_CONCURRENCY,
   DELAY_PROBE_FULL_INTERVAL_MINUTES,
   DELAY_PROBE_STARTUP_DELAY_MS,
   DELAY_PROBE_TIMEOUT,
-  SCRIPT_API_NAMED_PROBE_CONCURRENCY,
+  normalizeDelayProbeIntervalMinutes,
   SCRIPT_API_NAMED_PROBE_MAX_NAMES
 } from '../../shared/appConfig'
 import { getAppConfig } from '../config'
 import { createLogger } from '../utils/logger'
 import { mihomoProbeDelay, mihomoProxies } from './mihomoApi'
+import { acquireProbeSlots, releaseProbeSlots } from './probeGate'
 import {
   getFreshDelayRecord,
   getRecordAgeMs,
@@ -116,7 +116,7 @@ const state = {
   lastAliveCount: 0
 }
 
-let fullProbeCron: Cron | null = null
+let fullProbeTimer: NodeJS.Timeout | null = null
 let startupTimer: NodeJS.Timeout | null = null
 /** 同一时刻只允许一轮基线在跑，后来的调用复用同一个 Promise，避免事件密集触发时叠加 */
 let inflightProbe: Promise<void> | null = null
@@ -198,34 +198,6 @@ function classifyProbeStatus(status: number): ProbeErrCode | null {
 }
 
 /**
- * 名单探测的全局并发闸门。
- *
- * 为什么要信号量而不是每次调用各自开个滑动窗口：后者两个请求同时进来就是两倍并发。
- * 这里要的是跨请求共享的总量上限。
- *
- * 交接名额而不是「先减计数再让下一个抢」：后者中间有个计数为空的窗口，
- * 会被同一 tick 里的其他 acquire 插队，导致实际并发超过上限。
- */
-let namedProbeInflight = 0
-const namedProbeWaiters: (() => void)[] = []
-
-async function acquireNamedProbeSlot(): Promise<void> {
-  if (namedProbeInflight < SCRIPT_API_NAMED_PROBE_CONCURRENCY) {
-    namedProbeInflight += 1
-    return
-  }
-  await new Promise<void>((resolve) => {
-    namedProbeWaiters.push(resolve)
-  })
-}
-
-function releaseNamedProbeSlot(): void {
-  const next = namedProbeWaiters.shift()
-  if (next) next()
-  else namedProbeInflight -= 1
-}
-
-/**
  * 在飞去重表。
  *
  * key 是 `name + url`，**不含 timeout 也不含 maxDelay**：
@@ -239,8 +211,15 @@ const inflightByKey = new Map<string, Promise<IProbeDelayRecord>>()
 /**
  * 测一个节点并把结果写进 probeStore。永不抛异常。
  *
- * useSharedSlot=false 供基线使用：基线自己有滑动窗口（DELAY_PROBE_FULL_CONCURRENCY），
- * 不占名单探测的名额，两者最坏叠加见 appConfig 里 SCRIPT_API_NAMED_PROBE_CONCURRENCY 的注释。
+ * useSharedSlot 现在**恒为 true**：基线、名单探测、工位拨测共用 probeGate 这一个
+ * 全局闸门。保留这个参数只是为了让调用点显式声明意图（以及给测试留一个旁路口）。
+ *
+ * 为什么基线也必须占名额：不占的话两者可以叠加，瞬时并发 = 基线窗口 + 闸门额度。
+ * 实测各 200（峰值 400）时双通道哨兵 p50 直接翻倍、失败率 5.7%/6.2%，
+ * 是所有配置里对用户上网最狠的一种。详见 appConfig 的
+ * PROBE_GATE_CONCURRENCY 注释。
+ *
+ * 一次内核测速 = 一条连接 = 一个名额。
  */
 function probeOne(name: string, url: string, useSharedSlot: boolean): Promise<IProbeDelayRecord> {
   const key = `${name}\u0000${url}`
@@ -248,7 +227,7 @@ function probeOne(name: string, url: string, useSharedSlot: boolean): Promise<IP
   if (existing) return existing
 
   const task = (async () => {
-    if (useSharedSlot) await acquireNamedProbeSlot()
+    const slots = useSharedSlot ? await acquireProbeSlots(1) : 0
     try {
       const res = await mihomoProbeDelay(name, url, DELAY_PROBE_TIMEOUT)
       const err = classifyProbeStatus(res.status)
@@ -260,7 +239,7 @@ function probeOne(name: string, url: string, useSharedSlot: boolean): Promise<IP
       probeLogger.debug(`probe ${name} failed unexpectedly`, e)
       return recordDelayResult(name, { delay: 0, err: 'kernel_error', url })
     } finally {
-      if (useSharedSlot) releaseNamedProbeSlot()
+      if (slots > 0) releaseProbeSlots(slots)
     }
   })()
 
@@ -271,7 +250,14 @@ function probeOne(name: string, url: string, useSharedSlot: boolean): Promise<IP
   return tracked
 }
 
-/** 滑动窗口并发执行。基线用，不走信号量 */
+/**
+ * 滑动窗口并发执行。
+ *
+ * ⚠ 这**不是**峰值的最终闸门 —— 真正封顶的是 probeOne 里的 probeGate。
+ * 这一层的意义是限制「同时排队等名额的任务数」，避免一次性把几百个 Promise 挂上去。
+ * 两层叠起来的效果是：本轮基线最多 concurrency 个在排队或在飞，且与脚本探测、
+ * 工位拨测共享同一个全局额度。
+ */
 async function runWithWindow(
   names: string[],
   concurrency: number,
@@ -314,8 +300,9 @@ async function runFullProbe(reason: string): Promise<void> {
   }
 
   let alive = 0
+  // 第三参 true：与脚本的名单探测共用同一个全局闸门，杜绝两者叠加出双倍峰值。
   await runWithWindow(names, DELAY_PROBE_FULL_CONCURRENCY, async (name) => {
-    const record = await probeOne(name, url, false)
+    const record = await probeOne(name, url, true)
     if (record.delay > 0) alive += 1
   })
 
@@ -546,6 +533,22 @@ export async function probeNamedProxies(
   }
 }
 
+/**
+ * 读配置里的周期间隔（分钟）。0 = 关闭周期探测。
+ *
+ * 读不到配置时回落到默认值而不是 0：把「读配置失败」解释成「用户不想测速」会让
+ * probeStore 永远空着，脚本拿到空名单却查不出原因。
+ */
+async function resolveIntervalMinutes(): Promise<number> {
+  try {
+    const { delayProbeIntervalMinutes } = await getAppConfig()
+    return normalizeDelayProbeIntervalMinutes(delayProbeIntervalMinutes)
+  } catch (e) {
+    probeLogger.warn('Failed to read delay probe interval, falling back to default', e)
+    return DELAY_PROBE_FULL_INTERVAL_MINUTES
+  }
+}
+
 export async function initDelayProbe(): Promise<void> {
   stopDelayProbe()
 
@@ -554,22 +557,43 @@ export async function initDelayProbe(): Promise<void> {
   //
   // 这一轮不是可选项：probeStore 不落盘，冷启动时表是空的，
   // 而 isUsable() 读表 —— 没有这一轮，脚本会拿到空名单。
+  //
+  // ⚠ 即使用户把间隔设成 0（关闭周期探测），这一轮**照样跑**。0 的语义是
+  // 「不要每隔一段时间自动测」，不是「永远不要有数据」。同理事件触发
+  // （订阅更新 / 切配置 / 配置热重载）也不受间隔设置影响。
   startupTimer = setTimeout(() => {
     startupTimer = null
     void runProbeExclusive('startup')
   }, DELAY_PROBE_STARTUP_DELAY_MS)
 
-  try {
-    // 3 小时一轮。基线只负责覆盖，新鲜度由 lazy refresh 负责，
-    // 所以这里的周期是按流量账定的（642 个节点 × 8.01 KB × 8 轮/天 ≈ 1.2 GB/月）。
-    const hours = Math.max(1, Math.round(DELAY_PROBE_FULL_INTERVAL_MINUTES / 60))
-    fullProbeCron = new Cron(`0 0 */${hours} * * *`, () => {
-      void runProbeExclusive('cron')
-    })
-    probeLogger.info(`Delay probe scheduled every ${hours} hour(s)`)
-  } catch (e) {
-    probeLogger.warn('Failed to schedule delay probe cron', e)
+  const minutes = await resolveIntervalMinutes()
+  if (minutes <= 0) {
+    probeLogger.info('Periodic delay probe disabled by config (interval = 0)')
+    return
   }
+
+  // 用 setInterval 而不是 cron 表达式：这里的语义是「每隔 N 分钟」，而 cron 是
+  // 「在某些时刻」。旧实现写成 `0 0 */H * * *`，于是它其实是整点对齐的
+  // （0/3/6…点），任意分钟数根本表达不出来，还带来一个边界坑：2:59 启动 app
+  // 会在 2:59:20 跑一轮 startup，3:00:00 又被 cron 触发一轮，两轮能不能合并
+  // 完全取决于第一轮有没有跨过整点（靠单飞锁碰运气）。间隔计时没有这个问题。
+  fullProbeTimer = setInterval(
+    () => {
+      void runProbeExclusive('interval')
+    },
+    minutes * 60 * 1000
+  )
+  probeLogger.info(`Delay probe scheduled every ${minutes} minute(s)`)
+}
+
+/**
+ * 配置改了之后重建调度。供 IPC 在用户保存间隔设置后调用。
+ *
+ * 会重新走一遍 startup 延迟首轮 —— 这是刻意的：用户刚把间隔从 0 改成有值时，
+ * 大概率就是想要一轮数据，不该让他等一个完整周期。
+ */
+export async function restartDelayProbe(): Promise<void> {
+  await initDelayProbe()
 }
 
 export function stopDelayProbe(): void {
@@ -577,8 +601,8 @@ export function stopDelayProbe(): void {
     clearTimeout(startupTimer)
     startupTimer = null
   }
-  if (fullProbeCron) {
-    fullProbeCron.stop()
-    fullProbeCron = null
+  if (fullProbeTimer) {
+    clearInterval(fullProbeTimer)
+    fullProbeTimer = null
   }
 }

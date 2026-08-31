@@ -482,6 +482,14 @@ interface IAppConfig {
   scriptOutlets?: IScriptOutlet[]
   /** 脚本控制 API：受限 HTTP 接口，供脚本运行时切换策略组节点 */
   scriptApi?: IScriptApiConfig
+  /**
+   * 全量基线测速的间隔（分钟）。0 = 关闭周期测速。
+   *
+   * 关掉的只是「每隔一段时间自动跑」；启动后的首轮打底、以及订阅更新/切配置/
+   * 配置热重载触发的那几轮不受影响 —— probeStore 不落盘，完全不测会让脚本
+   * API 永远拿到空名单。留空按 DELAY_PROBE_FULL_INTERVAL_MINUTES 处理。
+   */
+  delayProbeIntervalMinutes?: number
   outletCardStatus?: CardStatus
 }
 
