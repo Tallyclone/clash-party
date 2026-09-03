@@ -11,10 +11,11 @@
  *   node scripts/cf-shield-probe.mjs --group "[能用]" --max-delay 800 --require majority
  *   node scripts/cf-shield-probe.mjs --targets https://claude.ai/,https://discord.com/
  *   node scripts/cf-shield-probe.mjs --limit 60          # 只测前 60 个（按延迟升序）
- *   node scripts/cf-shield-probe.mjs --outlet-prefix 过盾  # 只用备注 过盾01/过盾02… 的出口当工位
+ *   node scripts/cf-shield-probe.mjs --outlet-prefix 出口能用  # 只用备注 出口能用01/02… 的出口
  *
- * 参数不必都写在命令行上：脚本会读自己的配置文件（默认找 <仓库根>/cf-shield.config.json，
- * 其次 <仓库根>/scripts/cf-shield.config.json，也可 --settings <path> 指定）。
+ * 参数不必都写在命令行上：脚本会读自己的配置文件（默认找**脚本同目录**的
+ * scripts/cf-shield.config.json，其次兼容旧位置 <仓库根>/cf-shield.config.json，
+ * 也可 --settings <path> 指定）。
  * 取值优先级 = 命令行 > 配置文件 > 内置默认。配置文件是可选的，没有就用内置默认值。
  *
  * 每日自动更新「过盾」组（pm2 调度，见 ecosystem.cf-shield.config.cjs）：
@@ -32,6 +33,8 @@
  *   最低的那个。想看全量就加 `--dedupe-ip false`，输出的 yaml 里也留了 [过盾-全部] 组。
  * - 出口 IP 优先走主进程的 `POST /probe` `mode:"ip"`（它有专用探测工位、三目标并行、
  *   一次 50 个），旧版应用不支持时自动回落到经出口端口请求 `--ip-url` 逐个查。
+ * - 「工位」只用**没绑业务策略组**、且备注匹配 --outlet-prefix 的出口。7900「出口过盾」
+ *   绑着线上「过盾」组，绝不能当工位（会踩 P0，详见 filterOutlets() 的注释）。
  * - 结果写到 .snow/cf/ 下（gitignored）。
  */
 import fs from 'node:fs'
@@ -63,7 +66,8 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2))
 
-const REPO_ROOT = path.resolve(import.meta.dirname, '..')
+const SCRIPT_DIR = import.meta.dirname
+const REPO_ROOT = path.resolve(SCRIPT_DIR, '..')
 const DEFAULT_CONFIG_CANDIDATES = [
   path.join(REPO_ROOT, 'dist', 'win-unpacked', 'data', 'config.yaml'),
   path.join(process.env.APPDATA ?? '', 'clash-party', 'config.yaml'),
@@ -72,11 +76,15 @@ const DEFAULT_CONFIG_CANDIDATES = [
 
 /**
  * 探测器自己的配置文件（不是 Clash Party 的 config.yaml）。
- * 没有就用内置默认值，所以这个文件是可选的。
+ *
+ * 放**脚本同目录**：这份配置只服务这一个脚本，跟脚本待在一起比丢在仓库根好找，也不会
+ * 和仓库根那堆同名的 *.config.* 混淆（尤其别和 pm2 的 ecosystem.cf-shield.config.cjs
+ * 搞混）。仓库根的旧路径仍然认，但新的一律放脚本同目录。
+ * 一个候选都没有就用内置默认值，所以这个文件是可选的。
  */
 const DEFAULT_SETTINGS_CANDIDATES = [
-  path.join(REPO_ROOT, 'cf-shield.config.json'),
-  path.join(REPO_ROOT, 'scripts', 'cf-shield.config.json')
+  path.join(SCRIPT_DIR, 'cf-shield.config.json'),
+  path.join(REPO_ROOT, 'cf-shield.config.json')
 ]
 
 /**
@@ -176,9 +184,16 @@ const OPTIONS = {
   retry: pickNumber('retry', 'retry', 1),
   targets: pickTargets(),
   restore: pickBool('restore', 'restore', true),
-  // 只用备注以此开头的出口当「工位」。比如配了 `过盾`，就只挑 过盾01 / 过盾02 / …
-  // 留空（默认）= 用全部可用出口。用途：把出口池按用途分区，几个脚本各占一批互不抢。
+  // 【工位白名单】只用备注以此开头的出口当「工位」。配 `出口能用` 就只挑 出口能用01/02/…
+  // 留空 = 用全部非业务出口（仍受下面的黑名单约束）。用途：把出口池按用途分区，几个脚本
+  // 各占一批互不抢；以后新加的出口按这个前缀命名就自动进池，命名不合的不会被误用。
   outletPrefix: pickString('outlet-prefix', 'outletPrefix', '').trim(),
+  // 【工位黑名单】绑了这个**策略组**的出口永不当工位（填组名，不是出口备注）。
+  // 默认写死成线上的「过盾」组 —— 7900「出口过盾」是业务出口，当工位会直接踩 P0：
+  // 待测节点不是该组成员时 PUT /groups 回 400（那个节点整轮白丢），偶尔切换成功时又把
+  // 线上选中节点改成待测的脏节点。默认值刻意不留空，这样配置文件丢了也不会重新踩坑。
+  // ⚠ 想关掉它不能填空串（空串等同「没提供」，会回落到这个默认值），得填个不存在的组名。
+  shieldGroup: pickString('shield-group', 'shieldGroup', '过盾').trim(),
   // 同一出口 IP 只保留延迟最低的那个节点。机场常把一个 IP 拆成十几个「节点」卖，
   // 全塞进「过盾」组只会让手选列表变长，容灾能力一点没涨（那台机器一挂全挂）。
   dedupeIp: pickBool('dedupe-ip', 'dedupeIp', true),
@@ -332,18 +347,47 @@ if (ALL_OUTLETS.length === 0) {
   process.exit(1)
 }
 
-// 按备注前缀挑工位。命中 0 条时直接报错退出，不回落全部出口 ——
-// 静默回落会让脚本跑到别的分区上去抢工位，比明确失败更难查。
-const OUTLETS = OPTIONS.outletPrefix
-  ? ALL_OUTLETS.filter((item) => item.remark.startsWith(OPTIONS.outletPrefix))
-  : ALL_OUTLETS
-if (OUTLETS.length === 0) {
-  console.error(
-    `出口备注前缀「${OPTIONS.outletPrefix}」没有匹配到任何出口。` +
-      `当前可用出口备注：${ALL_OUTLETS.map((item) => item.remark || '(空)').join(' ')}`
-  )
-  process.exit(1)
+/**
+ * 挑「工位」出口：两道闸，方向相反，两个都要留着。
+ *
+ * ① shieldGroup（黑名单，看出口绑定的**策略组**）：绑了业务组的出口永不当工位。
+ *   这是 P0 的正解 —— 7900「出口过盾」绑的就是线上「过盾」组，被当工位后：待测节点
+ *   不是「过盾」成员时 PUT /groups 回 400，该节点整轮被跳过（实测每轮白丢 1~3 个）；
+ *   偶尔切换成功时线上「过盾」的选中节点会被改成待测的脏节点，而还原要等整轮跑完，
+ *   中间十几分钟走「过盾」就是随机跳节点。
+ * ② outletPrefix（白名单，看出口**备注**）：只有备注以此开头的出口能当工位。
+ *
+ * 两道闸方向相反，缺任何一道都会在「加出口」或「改组名」时重新踩坑：黑名单保证已知的
+ * 业务出口永远排除，白名单保证未知的新出口不会被默认拉进来当工位。
+ *
+ * 先黑后白。白名单命中 0 条时 exit 1 并列出所有可用备注，不静默回落成「用全部出口」——
+ * 静默回落会让脚本跑到别的分区上抢工位，比明确失败难查得多。
+ */
+function filterOutlets(all) {
+  const reserved = OPTIONS.shieldGroup
+    ? all.filter((item) => item.group === OPTIONS.shieldGroup)
+    : []
+  const usable = all.filter((item) => !reserved.includes(item))
+  if (usable.length === 0) {
+    console.error(
+      `排除业务出口（绑定组「${OPTIONS.shieldGroup}」）后没有工位可用。` +
+        `当前出口绑定的组：${all.map((item) => item.group).join(' ')}`
+    )
+    process.exit(1)
+  }
+  if (!OPTIONS.outletPrefix) return { picked: usable, reserved }
+  const picked = usable.filter((item) => item.remark.startsWith(OPTIONS.outletPrefix))
+  if (picked.length === 0) {
+    console.error(
+      `出口备注前缀「${OPTIONS.outletPrefix}」没有匹配到任何出口。` +
+        `当前可用出口备注：${usable.map((item) => item.remark || '(空)').join(' ')}`
+    )
+    process.exit(1)
+  }
+  return { picked, reserved }
 }
+
+const { picked: OUTLETS, reserved: RESERVED_OUTLETS } = filterOutlets(ALL_OUTLETS)
 
 /**
  * 切换出口组的选中节点。
@@ -659,11 +703,18 @@ async function main() {
     `来源组     ${OPTIONS.group}  可用 ${groupInfo.usable ?? nodes.length} / 共 ${groupInfo.total ?? '?'}`
   )
   console.log(`探测目标   ${OPTIONS.targets.join('  ')}   判定=${OPTIONS.require}`)
+  // 回归哨兵：这行没打出来就说明黑名单闸破了，7900 可能又混进了工位池
+  if (RESERVED_OUTLETS.length > 0) {
+    console.log(
+      `已保留业务出口 ${RESERVED_OUTLETS.length} 条不作工位：` +
+        RESERVED_OUTLETS.map((item) => `${item.remark || '(空备注)'}(${item.port})`).join(' ')
+    )
+  }
   console.log(
     `并发出口   ${OUTLETS.length} 条（端口 ${OUTLETS[0].port}~${OUTLETS[OUTLETS.length - 1].port}）` +
       (OPTIONS.outletPrefix
-        ? `  按备注前缀「${OPTIONS.outletPrefix}」筛出，共 ${ALL_OUTLETS.length} 条可用`
-        : '  未设前缀，用全部出口')
+        ? `  按备注前缀「${OPTIONS.outletPrefix}」筛出，共 ${ALL_OUTLETS.length} 条出口`
+        : '  未设前缀，用全部非业务出口')
   )
   console.log(`待测节点   ${nodes.length} 个，共 ${Math.ceil(nodes.length / OUTLETS.length)} 轮\n`)
 

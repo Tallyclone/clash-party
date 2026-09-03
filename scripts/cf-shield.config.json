@@ -1,0 +1,29 @@
+{
+  "$comment": [
+    "cf-shield-probe.mjs 的参数配置文件。优先级：命令行 > 本文件 > 脚本内置默认。",
+    "候选路径按顺序探测：<脚本同目录>/cf-shield.config.json（就是本文件）、<仓库根>/cf-shield.config.json（旧位置，仍兼容）。",
+    "也可以用 --settings <path> 显式指定（指定了却不存在会直接 exit 1）。",
+    "键名用 camelCase，对应 CLI 的 --kebab-case（如 minApply ↔ --min-apply）。",
+    "注意：不要把 scriptApi 的 token 写进来，脚本从 Clash Party 的 config.yaml 自己读。",
+    "注意：别和 pm2 的 ecosystem.cf-shield.config.cjs 搞混，那个是调度配置，这个是探测参数。",
+    "故意不写 apply：手动试跑时忘了它是 true 会直接改线上覆写并重载内核，所以只让 pm2 的 args 带 --apply。",
+    "",
+    "outletPrefix / shieldGroup 是「哪些出口能当工位」的两道闸，方向相反，两个都要留着：",
+    "  outletPrefix = 白名单，只把备注以此开头的出口当工位（出口能用01~50，端口 7800~7849）。",
+    "  shieldGroup  = 黑名单，绑了这个策略组的出口永不当工位（值是出口的「出口目标」组名，不是备注）。",
+    "为什么 7900「出口过盾」绝不能当工位：它是线上业务出口。被当工位后 —— 待测节点不是「过盾」",
+    "  成员时 API 回 400，该节点整轮被跳过（实测每轮白丢 1~3 个）；偶尔切换成功时线上「过盾」组的",
+    "  选中节点会被改成待测的脏节点，而还原要等整轮跑完，中间十几分钟走「过盾」就是随机跳节点。",
+    "以后加出口按 出口能用NN 命名就自动进工位池；命名不合前缀的出口不会被误用。",
+    "⚠ outletPrefix 命中 0 条时脚本直接 exit 1 并列出所有可用备注，不会静默回落成「用全部出口」。",
+    "⚠ 两道闸都不能用空串关闭（空串等同「没提供」，会回落到脚本内置默认值），要关只能填一个不存在的组名。"
+  ],
+  "targets": ["https://nowsecure.nl/", "https://discord.com/"],
+  "require": "all",
+  "timeout": 12000,
+  "retry": 2,
+  "minApply": 3,
+  "dedupeIp": true,
+  "outletPrefix": "出口能用",
+  "shieldGroup": "过盾"
+}
